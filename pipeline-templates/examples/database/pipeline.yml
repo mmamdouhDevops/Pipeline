@@ -1,0 +1,9 @@
+# pipeline.yml – standalone database repository (reporting DB, shared reference data, …)
+# Scripts: sql/migrations/NNN_description.sql – applied once, in order, recorded in dbo.__ScriptHistory.
+version: 1
+components:
+  - name: reporting-db
+    type: database
+    path: .
+    sql_dir: sql/migrations
+    backup: always

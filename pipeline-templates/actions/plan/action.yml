@@ -1,0 +1,90 @@
+name: plan
+description: >
+  Reads the consumer's pipeline.yml, merges each component with its type definition (types/<type>.yml)
+  and returns a job matrix. In CI it keeps only components whose files changed; in CD it validates the
+  branch (release/* or hotfix/*) and computes the release version.
+inputs:
+  config:
+    description: Path to pipeline.yml in the consumer repo
+    default: pipeline.yml
+  mode:
+    description: ci | cd
+    required: true
+  components:
+    description: Optional comma-separated component names to keep (CD manual runs)
+    default: ""
+  base-ref:
+    description: Base branch for change detection (CI)
+    default: ""
+outputs:
+  matrix:
+    description: '{"include":[ ...components... ]}'
+    value: ${{ steps.plan.outputs.matrix }}
+  matrix-build:
+    value: ${{ steps.plan.outputs.matrix_build }}
+  count-build:
+    value: ${{ steps.plan.outputs.count_build }}
+  matrix-sonar:
+    value: ${{ steps.plan.outputs.matrix_sonar }}
+  count-sonar:
+    value: ${{ steps.plan.outputs.count_sonar }}
+  matrix-snyk:
+    value: ${{ steps.plan.outputs.matrix_snyk }}
+  count-snyk:
+    value: ${{ steps.plan.outputs.count_snyk }}
+  matrix-dbcheck:
+    value: ${{ steps.plan.outputs.matrix_dbcheck }}
+  count-dbcheck:
+    value: ${{ steps.plan.outputs.count_dbcheck }}
+  matrix-contract:
+    value: ${{ steps.plan.outputs.matrix_contract }}
+  count-contract:
+    value: ${{ steps.plan.outputs.count_contract }}
+  matrix-dast:
+    value: ${{ steps.plan.outputs.matrix_dast }}
+  count-dast:
+    value: ${{ steps.plan.outputs.count_dast }}
+  count:
+    value: ${{ steps.plan.outputs.count }}
+  names:
+    value: ${{ steps.plan.outputs.names }}
+  any-dotnet:
+    value: ${{ steps.plan.outputs.any_dotnet }}
+  any-node:
+    value: ${{ steps.plan.outputs.any_node }}
+  any-db:
+    value: ${{ steps.plan.outputs.any_db }}
+  any-contract:
+    value: ${{ steps.plan.outputs.any_contract }}
+  any-dast:
+    value: ${{ steps.plan.outputs.any_dast }}
+  version:
+    value: ${{ steps.plan.outputs.version }}
+  semver:
+    value: ${{ steps.plan.outputs.semver }}
+  channel:
+    description: release | hotfix
+    value: ${{ steps.plan.outputs.channel }}
+runs:
+  using: composite
+  steps:
+    - name: Ensure PyYAML
+      shell: bash
+      run: |
+        python3 -c 'import yaml' 2>/dev/null || {
+          (sudo -n apt-get install -y python3-yaml >/dev/null 2>&1) ||
+          pip3 install --user --break-system-packages pyyaml >/dev/null 2>&1 ||
+          pip3 install --user pyyaml >/dev/null; }
+    - id: plan
+      shell: bash
+      env:
+        PLAN_CONFIG: ${{ inputs.config }}
+        PLAN_MODE: ${{ inputs.mode }}
+        PLAN_ONLY: ${{ inputs.components }}
+        PLAN_BASE: ${{ inputs.base-ref }}
+        PLAN_TYPES_DIR: ${{ github.action_path }}/../../types
+        PLAN_REF_NAME: ${{ github.ref_name }}
+        PLAN_HEAD_REF: ${{ github.head_ref }}
+        PLAN_RUN_NUMBER: ${{ github.run_number }}
+        PLAN_REPO: ${{ github.event.repository.name }}
+      run: python3 "${{ github.action_path }}/plan.py"

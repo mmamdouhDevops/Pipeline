@@ -1,0 +1,21 @@
+# pipeline.yml – TaskManager-backend (ABP 10 / .NET 10 API + SQL Server via EF Core / DbMigrator)
+# Schema: docs/PIPELINE-YML.md in pipeline-templates.
+version: 1
+components:
+  - name: taskmanager-api
+    type: backend-dotnet
+    path: .
+    solution: TaskManager.sln                 # use TaskManager.slnx if your ABP template generated one
+    publish_project: src/TaskManager.HttpApi.Host/TaskManager.HttpApi.Host.csproj
+    test_projects: "test/**/*Tests.csproj"
+    abp_install_libs: true                    # wwwroot/libs (gitignored) are restored at build time
+    owns_database: true
+    migrator_project: src/TaskManager.DbMigrator/TaskManager.DbMigrator.csproj
+    ef_project: src/TaskManager.EntityFrameworkCore/TaskManager.EntityFrameworkCore.csproj
+    backup: always                            # always | on_migration | never
+    always_run_migrator: true                 # ABP DbMigrator also seeds data (admin, OpenIddict clients)
+    port: 5000
+    health_path: /health-status               # ABP template health endpoint
+    openapi_path: /swagger/v1/swagger.json    # used by the ZAP API scan (DAST)
+    deploy_path: /var/www/taskmanager-api
+    sonar_project_key: taskmanager-backend

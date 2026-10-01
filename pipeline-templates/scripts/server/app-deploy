@@ -1,0 +1,311 @@
+#!/usr/bin/env bash
+# =============================================================================================
+#  app-deploy – server-side deployment helper (installed to /usr/local/sbin/app-deploy, root:root 755)
+#  The CI/CD deploy user may run ONLY this command with sudo (see prepare-server-ubuntu2404.sh).
+#
+#    app-deploy install <bundle-dir>        install a release (manifest.json + package.tar.gz [+ app.env,
+#                                           appsettings.json, runtime-config.json, files/*]); health check;
+#                                           automatic rollback to the previous release on failure
+#    app-deploy rollback <name>             switch back to the previous release
+#    app-deploy status [<name>]             current/previous release per component
+#    app-deploy prune-backups <dir> <db> <keep>   keep newest <keep> <db>_*.bak files
+#    app-deploy version
+#
+#  Layout per component:  <deploy_path>/releases/<version>/   <deploy_path>/current -> releases/<version>
+#                         <deploy_path>/shared/ (Logs, certificates, dynamic-env.json)
+#                         /etc/app-deploy/<name>.env (secrets)   /var/lib/app-deploy/<name>/ (state)
+# =============================================================================================
+set -euo pipefail
+VERSION_HELPER="1.0.0"
+STATE_ROOT=/var/lib/app-deploy
+CONF_ROOT=/etc/app-deploy
+log()  { echo "[app-deploy] $*"; }
+die()  { echo "[app-deploy] ERROR: $*" >&2; exit 1; }
+[[ $EUID -eq 0 ]] || die "must run as root (sudo)"
+command -v jq >/dev/null || die "jq is required"
+
+j() { jq -r "$1 // empty" "$MANIFEST"; }
+
+load_manifest() {
+  MANIFEST="$1"
+  NAME=$(j .name);           PKG_TYPE=$(j .package);     VERSION=$(j .version)
+  SVC=$(j .service_name);    SVC_USER=$(j .service_user); DEPLOY_PATH=$(j .deploy_path)
+  PORT=$(j .port);           HEALTH_PATH=$(j .health_path); KEEP=$(j .keep_releases)
+  ENTRY=$(j .entry);         APP_MODULE=$(j .app_module); RUNTIME_ENV=$(j .runtime_env)
+  SERVER_NAME=$(j .server_name); TLS_CERT=$(j .tls_cert); TLS_KEY=$(j .tls_key)
+  : "${KEEP:=5}" "${RUNTIME_ENV:=Production}" "${TLS_CERT:=/etc/ssl/app/server.crt}" "${TLS_KEY:=/etc/ssl/app/server.key}"
+  [[ "$NAME" =~ ^[a-z0-9][a-z0-9-]{1,62}$ ]] || die "invalid name '$NAME'"
+  [[ "$SVC" =~ ^[a-z0-9][a-z0-9-]{1,62}$ ]]  || die "invalid service name '$SVC'"
+  [[ "$DEPLOY_PATH" =~ ^/(var/www|opt|srv)/[a-zA-Z0-9._/-]+$ ]] || die "deploy_path must be under /var/www, /opt or /srv"
+  [[ "$VERSION" =~ ^[0-9A-Za-z.+-]+$ ]] || die "invalid version '$VERSION'"
+  STATE="$STATE_ROOT/$NAME"
+}
+
+# ------------------------------------------------------------------ systemd unit (dotnet / python)
+write_unit() {
+  local exec workdir
+  case "$PKG_TYPE" in
+    dotnet) exec="$(readlink -f "$(command -v dotnet)") $DEPLOY_PATH/current/app/$ENTRY"; workdir="$DEPLOY_PATH/current/app" ;;
+    python) exec="$DEPLOY_PATH/current/venv/bin/python -m uvicorn $APP_MODULE --host 127.0.0.1 --port $PORT"; workdir="$DEPLOY_PATH/current/app" ;;
+  esac
+  cat > "/etc/systemd/system/$SVC.service" <<EOF
+# managed by app-deploy – do not edit
+[Unit]
+Description=$NAME ($PKG_TYPE)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=$SVC_USER
+Group=$SVC_USER
+WorkingDirectory=$workdir
+ExecStart=$exec
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=30
+SyslogIdentifier=$SVC
+Environment=ASPNETCORE_ENVIRONMENT=$RUNTIME_ENV
+Environment=DOTNET_ENVIRONMENT=$RUNTIME_ENV
+Environment=ASPNETCORE_URLS=http://127.0.0.1:$PORT
+Environment=ASPNETCORE_FORWARDEDHEADERS_ENABLED=true
+Environment=DOTNET_PRINT_TELEMETRY_MESSAGE=false
+EnvironmentFile=-$CONF_ROOT/$NAME.env
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable "$SVC" >/dev/null 2>&1
+}
+
+# ------------------------------------------------------------------ nginx site
+write_nginx() {
+  [[ -n "$SERVER_NAME" ]] || return 0
+  command -v nginx >/dev/null || die "nginx not installed"
+  [[ -f "$TLS_CERT" && -f "$TLS_KEY" ]] || die "TLS certificate missing ($TLS_CERT / $TLS_KEY)"
+  local conf="/etc/nginx/sites-available/app-$NAME.conf" tmp; tmp=$(mktemp)
+  {
+    cat <<EOF
+# managed by app-deploy – do not edit
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $SERVER_NAME;
+    return 301 https://\$host\$request_uri;
+}
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name $SERVER_NAME;
+    ssl_certificate     $TLS_CERT;
+    ssl_certificate_key $TLS_KEY;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    add_header X-Content-Type-Options nosniff always;
+    add_header Referrer-Policy strict-origin-when-cross-origin always;
+EOF
+    if [[ "$PKG_TYPE" == "static" ]]; then
+      cat <<EOF
+    root $DEPLOY_PATH/current/app;
+    index index.html;
+    add_header X-Frame-Options SAMEORIGIN always;
+    gzip on;
+    gzip_types text/css application/javascript application/json image/svg+xml;
+    location = /getEnvConfig {
+        default_type application/json;
+        alias $DEPLOY_PATH/shared/dynamic-env.json;
+        add_header Cache-Control "no-store";
+    }
+    location ~* \.(?:js|css|woff2?|ttf|eot|svg|png|jpg|jpeg|gif|ico)$ {
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+        try_files \$uri =404;
+    }
+    location / {
+        try_files \$uri \$uri/ /index.html;
+        add_header Cache-Control "no-cache";
+    }
+}
+EOF
+    else
+      cat <<EOF
+    client_max_body_size 20m;
+    proxy_buffer_size 128k;
+    proxy_buffers 4 256k;
+    proxy_busy_buffers_size 256k;
+    large_client_header_buffers 4 32k;
+    location / {
+        proxy_pass http://127.0.0.1:$PORT;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \$connection_upgrade;
+        proxy_read_timeout 120s;
+    }
+}
+EOF
+    fi
+  } > "$tmp"
+  # shared WebSocket map (once per server)
+  [[ -f /etc/nginx/conf.d/app-deploy-map.conf ]] || cat > /etc/nginx/conf.d/app-deploy-map.conf <<'EOF'
+map $http_upgrade $connection_upgrade { default upgrade; '' close; }
+EOF
+  local backup=""; [[ -f "$conf" ]] && { backup=$(mktemp); cp "$conf" "$backup"; }
+  install -m 644 "$tmp" "$conf"; rm -f "$tmp"
+  ln -sf "$conf" "/etc/nginx/sites-enabled/app-$NAME.conf"
+  if ! nginx -t 2>/tmp/app-deploy-nginx.err; then
+    cat /tmp/app-deploy-nginx.err >&2
+    if [[ -n "$backup" ]]; then cp "$backup" "$conf"; else rm -f "$conf" "/etc/nginx/sites-enabled/app-$NAME.conf"; fi
+    die "nginx configuration test failed – previous config restored"
+  fi
+}
+
+# ------------------------------------------------------------------ switch / restart / health
+switch_to() { ln -sfn "$1" "$DEPLOY_PATH/current.new" && mv -Tf "$DEPLOY_PATH/current.new" "$DEPLOY_PATH/current"; }
+
+restart() {
+  case "$PKG_TYPE" in
+    dotnet|python) systemctl restart "$SVC" ;;
+    static)        systemctl reload nginx ;;
+  esac
+}
+
+health() {
+  local i
+  case "$PKG_TYPE" in
+    dotnet|python)
+      for i in $(seq 1 45); do
+        curl -fsS -o /dev/null --max-time 5 "http://127.0.0.1:$PORT$HEALTH_PATH" && { log "healthy (http://127.0.0.1:$PORT$HEALTH_PATH)"; return 0; }
+        systemctl is-failed --quiet "$SVC" && break
+        sleep 2
+      done
+      journalctl -u "$SVC" -n 40 --no-pager >&2 || true
+      return 1 ;;
+    static)
+      [[ -f "$DEPLOY_PATH/current/app/index.html" ]] || return 1
+      [[ -z "$SERVER_NAME" ]] && return 0
+      for i in $(seq 1 10); do
+        curl -kfsS -o /dev/null --max-time 5 --resolve "$SERVER_NAME:443:127.0.0.1" "https://$SERVER_NAME/" && { log "healthy (https://$SERVER_NAME/)"; return 0; }
+        sleep 1
+      done
+      return 1 ;;
+  esac
+}
+
+prune_releases() {
+  local cur prev; cur=$(readlink -f "$DEPLOY_PATH/current" || true); prev=$(cat "$STATE/previous" 2>/dev/null || true)
+  ls -1dt "$DEPLOY_PATH"/releases/*/ 2>/dev/null | sed 's#/$##' | tail -n +"$((KEEP + 1))" | while read -r r; do
+    [[ "$r" == "$cur" || "$r" == "$prev" ]] && continue
+    rm -rf "$r" && log "pruned $r"
+  done
+}
+
+# ================================================================== commands
+cmd_install() {
+  local B; B=$(readlink -f "$1"); [[ -f "$B/manifest.json" && -f "$B/package.tar.gz" ]] || die "bundle incomplete: $B"
+  load_manifest "$B/manifest.json"
+  log "install $NAME $VERSION ($PKG_TYPE) → $DEPLOY_PATH"
+  mkdir -p "$STATE" "$CONF_ROOT" "$DEPLOY_PATH/releases" "$DEPLOY_PATH/shared"
+  local REL="$DEPLOY_PATH/releases/$VERSION"; [[ -e "$REL" ]] && REL="$REL-$(date +%s)"
+  mkdir -p "$REL" && tar -xzf "$B/package.tar.gz" -C "$REL"
+
+  if [[ "$PKG_TYPE" != "static" ]]; then
+    id -u "$SVC_USER" >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin "$SVC_USER"
+  fi
+  local GROUP="$SVC_USER"; [[ "$PKG_TYPE" == "static" ]] && GROUP=www-data
+
+  # secrets + shared files (persist across releases)
+  if [[ -f "$B/app.env" ]]; then install -o root -g "$GROUP" -m 640 "$B/app.env" "$CONF_ROOT/$NAME.env"; fi
+  if [[ -d "$B/files" ]]; then
+    for f in "$B"/files/*; do [[ -e "$f" ]] || continue
+      install -o root -g "$GROUP" -m 640 "$f" "$DEPLOY_PATH/shared/$(basename "$f")"
+    done
+  fi
+
+  case "$PKG_TYPE" in
+    dotnet)
+      [[ -f "$B/appsettings.json" ]] && install -o root -g "$GROUP" -m 640 "$B/appsettings.json" "$REL/app/appsettings.$RUNTIME_ENV.json"
+      mkdir -p "$DEPLOY_PATH/shared/Logs" && chown "$SVC_USER:$SVC_USER" "$DEPLOY_PATH/shared/Logs"
+      rm -rf "$REL/app/Logs" && ln -s "$DEPLOY_PATH/shared/Logs" "$REL/app/Logs"
+      for f in "$DEPLOY_PATH"/shared/*; do b=$(basename "$f"); [[ "$b" == Logs ]] && continue; ln -sfn "$f" "$REL/app/$b"; done
+      chown -R root:"$GROUP" "$REL" && chmod -R g+rX,o-rwx "$REL"
+      write_unit ;;
+    python)
+      python3 -m venv "$REL/venv"
+      "$REL/venv/bin/pip" install -q --no-index --find-links "$REL/wheels" -r "$REL/app/requirements.txt"
+      for f in "$DEPLOY_PATH"/shared/*; do [[ -e "$f" ]] && ln -sfn "$f" "$REL/app/$(basename "$f")"; done
+      chown -R root:"$GROUP" "$REL" && chmod -R g+rX,o-rwx "$REL"
+      write_unit ;;
+    static)
+      [[ -f "$B/runtime-config.json" ]] && install -o root -g www-data -m 640 "$B/runtime-config.json" "$DEPLOY_PATH/shared/dynamic-env.json"
+      chown -R root:www-data "$REL" "$DEPLOY_PATH/shared" && chmod -R g+rX,o-rwx "$REL" ;;
+    *) die "unsupported package type $PKG_TYPE" ;;
+  esac
+
+  write_nginx
+  local PREV; PREV=$(readlink -f "$DEPLOY_PATH/current" 2>/dev/null || true)
+  switch_to "$REL"
+  restart
+  [[ -n "$SERVER_NAME" && "$PKG_TYPE" != "static" ]] && systemctl reload nginx
+  if health; then
+    [[ -n "$PREV" && "$PREV" != "$REL" ]] && echo "$PREV" > "$STATE/previous"
+    cp "$B/manifest.json" "$STATE/manifest.json"
+    echo "$(date -Is) install $VERSION $REL" >> "$STATE/history"
+    prune_releases
+    log "✅ $NAME $VERSION is live"
+  else
+    log "❌ health check failed – rolling back"
+    if [[ -n "$PREV" && -d "$PREV" ]]; then
+      switch_to "$PREV"; restart
+      health && log "rolled back to $(basename "$PREV")" || log "previous release is unhealthy too!"
+    fi
+    echo "$(date -Is) FAILED $VERSION $REL" >> "$STATE/history"
+    exit 1
+  fi
+}
+
+cmd_rollback() {
+  local name="$1"; [[ -f "$STATE_ROOT/$name/manifest.json" ]] || die "no deployment state for $name"
+  load_manifest "$STATE_ROOT/$name/manifest.json"
+  local prev cur; prev=$(cat "$STATE/previous" 2>/dev/null || true); cur=$(readlink -f "$DEPLOY_PATH/current")
+  [[ -n "$prev" && -d "$prev" ]] || die "no previous release recorded for $name"
+  log "rollback $name: $(basename "$cur") → $(basename "$prev")"
+  switch_to "$prev"; restart
+  health || die "rolled-back release is not healthy"
+  echo "$cur" > "$STATE/previous"
+  echo "$(date -Is) rollback $(basename "$prev") (from $(basename "$cur"))" >> "$STATE/history"
+  log "✅ rolled back"
+}
+
+cmd_status() {
+  for m in "$STATE_ROOT"/${1:-*}/manifest.json; do
+    [[ -f "$m" ]] || continue
+    load_manifest "$m"
+    printf "%-28s current=%-24s previous=%s\n" "$NAME" "$(basename "$(readlink -f "$DEPLOY_PATH/current")")" \
+      "$(basename "$(cat "$STATE/previous" 2>/dev/null || echo -)")"
+  done
+}
+
+cmd_prune_backups() {
+  local dir="$1" db="$2" keep="$3"
+  [[ "$db" =~ ^[A-Za-z0-9_]+$ && "$keep" =~ ^[0-9]+$ && -d "$dir" ]] || die "usage: prune-backups <dir> <db> <keep>"
+  ls -1t "$dir/${db}"_*.bak 2>/dev/null | tail -n +"$((keep + 1))" | xargs -r rm -f --
+  log "kept newest $keep backups of $db in $dir"
+}
+
+case "${1:-}" in
+  install)        cmd_install "${2:?bundle dir}" ;;
+  rollback)       cmd_rollback "${2:?component name}" ;;
+  status)         cmd_status "${2:-}" ;;
+  prune-backups)  cmd_prune_backups "${2:?}" "${3:?}" "${4:?}" ;;
+  version)        echo "$VERSION_HELPER" ;;
+  *) sed -n '2,20p' "$0"; exit 2 ;;
+esac

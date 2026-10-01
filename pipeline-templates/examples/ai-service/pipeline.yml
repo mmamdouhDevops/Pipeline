@@ -1,0 +1,14 @@
+# pipeline.yml – AI / VLM service (Python FastAPI behind Nginx on the AI server role)
+version: 1
+components:
+  - name: vlm-service
+    type: ai-service
+    path: .
+    python_version: "3.12"
+    requirements: requirements.txt
+    app_module: app.main:app
+    test_command: pip install -q -r requirements-dev.txt && python -m pytest -q
+    port: 8000
+    health_path: /health
+    openapi_path: /openapi.json
+    deploy_path: /opt/vlm-service

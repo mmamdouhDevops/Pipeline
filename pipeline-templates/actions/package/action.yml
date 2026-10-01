@@ -1,0 +1,26 @@
+name: package
+description: >
+  Builds ONE immutable release package for a component (type-specific), with package.json metadata
+  and a SHA-256 checksum: dist/<name>-<version>.tar.gz (+ .sha256). The same package is deployed
+  to test, staging and production.
+inputs:
+  component:
+    description: Component JSON (one matrix item from the plan action)
+    required: true
+  version:
+    required: true
+outputs:
+  staging-dir:
+    description: Folder with the unpacked package content (used for SBOM)
+    value: ${{ steps.pkg.outputs.staging_dir }}
+  file:
+    value: ${{ steps.pkg.outputs.file }}
+runs:
+  using: composite
+  steps:
+    - id: pkg
+      shell: bash
+      env:
+        COMPONENT_JSON: ${{ inputs.component }}
+        VERSION: ${{ inputs.version }}
+      run: bash "${{ github.action_path }}/package.sh"

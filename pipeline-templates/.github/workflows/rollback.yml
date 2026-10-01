@@ -1,0 +1,60 @@
+# =============================================================================================
+#  Roll a component back to its previous release on every host of its role.
+#  Consumers expose it as a manual workflow (see examples/*/.github/workflows/rollback.yml).
+#  Database changes are NOT reverted automatically – restore from the pre-deploy backup if needed
+#  (docs/RUNBOOK.md › "Restore a database backup").
+# =============================================================================================
+name: rollback
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        type: string
+        required: true
+      component:
+        type: string
+        required: true
+      config:
+        type: string
+        default: pipeline.yml
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: plan
+        uses: mmamdouhDevops/pipeline-templates/actions/plan@v1
+        with:
+          config: ${{ inputs.config }}
+          mode: ci
+          components: ${{ inputs.component }}
+
+  rollback:
+    name: Rollback ${{ inputs.component }} on ${{ inputs.environment }}
+    needs: plan
+    runs-on: ${{ fromJSON(inputs.environment == 'test' && (vars.RUNNER_DEPLOY_TEST || '["self-hosted","linux","env-test"]') || inputs.environment == 'staging' && (vars.RUNNER_DEPLOY_STAGING || '["self-hosted","linux","env-staging"]') || (vars.RUNNER_DEPLOY_PRODUCTION || '["self-hosted","linux","env-production"]')) }}
+    environment: ${{ inputs.environment }}
+    strategy:
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: mmamdouhDevops/pipeline-templates/actions/deploy@v1
+        with:
+          component: ${{ toJSON(matrix) }}
+          version: rollback
+          environment: ${{ inputs.environment }}
+          action: rollback
+        env:
+          DEPLOY_MODE: ${{ vars.DEPLOY_MODE }}
+          WEB_HOSTS: ${{ vars.WEB_HOSTS }}
+          API_HOSTS: ${{ vars.API_HOSTS }}
+          INTEGRATION_HOSTS: ${{ vars.INTEGRATION_HOSTS }}
+          DB_HOSTS: ${{ vars.DB_HOSTS }}
+          AI_HOSTS: ${{ vars.AI_HOSTS }}
+          DEPLOY_SSH_USER: ${{ vars.DEPLOY_SSH_USER }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_SSH_KNOWN_HOSTS: ${{ vars.DEPLOY_SSH_KNOWN_HOSTS }}
+          PUBLIC_URL: ${{ vars[matrix.public_url_var] }}

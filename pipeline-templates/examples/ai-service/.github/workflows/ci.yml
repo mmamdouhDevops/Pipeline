@@ -1,0 +1,28 @@
+# CI – runs on every pull request into develop / main / release/* / hotfix/*.
+# Required status check in the rulesets: "CI / Summary"  (job id CI + template job "Summary").
+name: CI
+
+on:
+  pull_request:
+    branches: [develop, main, 'release/**', 'hotfix/**']
+    types: [opened, synchronize, reopened, ready_for_review, edited, labeled, unlabeled]
+
+concurrency:
+  group: ci-${{ github.repository }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: read
+  security-events: write   # SARIF upload (only when vars.UPLOAD_SARIF == 'true')
+  actions: read
+
+jobs:
+  CI:
+    if: github.event.pull_request.draft == false
+    uses: mmamdouhDevops/pipeline-templates/.github/workflows/ci-component.yml@v1
+    with:
+      config: pipeline.yml
+      # runner: '["self-hosted","linux","ci"]'   # default: vars.RUNNER_CI
+      # enable_checkmarx: false                  # switch a scanner off per repo if needed
+    secrets: inherit

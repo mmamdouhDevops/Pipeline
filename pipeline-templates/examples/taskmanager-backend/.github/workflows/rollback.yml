@@ -1,0 +1,25 @@
+# Manual rollback of one component to its previous release (goes through the environment's protection).
+name: Rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        type: choice
+        options: [test, staging, production]
+        required: true
+      component:
+        description: Component name from pipeline.yml
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  Rollback:
+    uses: mmamdouhDevops/pipeline-templates/.github/workflows/rollback.yml@v1
+    with:
+      environment: ${{ inputs.environment }}
+      component: ${{ inputs.component }}
+    secrets: inherit

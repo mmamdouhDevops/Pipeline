@@ -1,0 +1,145 @@
+# =============================================================================================
+#  One deployment stage (test | staging | production). Called by cd-component.yml.
+#
+#  Approval: vars.APPROVAL_MODE
+#    environment (default) – GitHub Environment "required reviewers" (public repos, or Enterprise Cloud)
+#    issue                 – an approval issue; works on every plan (approvers: vars.APPROVERS_<ENV>)
+#    none                  – no gate (only for sandboxes)
+#
+#  Per component (matrix): runner tasks (DB backup / migrations / scripts) → host tasks on every server
+#  of the component's role (install, health, automatic rollback) → post tasks (smoke, contract) → DAST.
+# =============================================================================================
+name: deploy-stage
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        type: string
+        required: true
+      version:
+        type: string
+        required: true
+      channel:
+        type: string
+        required: true
+      matrix:
+        type: string
+        required: true
+      runner:
+        description: JSON labels of the deploy runner for this environment
+        type: string
+        required: true
+      run_dast:
+        type: boolean
+        default: false
+
+jobs:
+  # -------------------------------------------------------------------------------- approval (issue mode)
+  approval:
+    name: Approval · ${{ inputs.environment }}
+    if: vars.APPROVAL_MODE == 'issue'
+    runs-on: ubuntu-latest          # waiting must not block a self-hosted runner
+    timeout-minutes: 360
+    permissions:
+      issues: write
+    steps:
+      - name: Resolve approvers
+        id: who
+        shell: bash
+        env:
+          T: ${{ vars.APPROVERS_TEST }}
+          S: ${{ vars.APPROVERS_STAGING }}
+          P: ${{ vars.APPROVERS_PRODUCTION }}
+        run: |
+          case "${{ inputs.environment }}" in test) a=$T;; staging) a=$S;; production) a=$P;; esac
+          [[ -n "$a" ]] || { echo "::error::vars.APPROVERS_${{ inputs.environment }} (comma-separated GitHub users) is not set"; exit 1; }
+          echo "list=$a" >> "$GITHUB_OUTPUT"
+      - uses: trstringer/manual-approval@v1
+        with:
+          secret: ${{ github.token }}
+          approvers: ${{ steps.who.outputs.list }}
+          minimum-approvals: ${{ inputs.environment == 'production' && 2 || 1 }}
+          exclude-workflow-initiator-as-approver: true
+          issue-title: "Deploy ${{ inputs.version }} (${{ inputs.channel }}) to ${{ inputs.environment }}"
+          issue-body: |
+            Repository: ${{ github.repository }}
+            Branch: ${{ github.ref_name }} @ ${{ github.sha }}
+            Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            Comment **approve** or **deny**.
+
+  # -------------------------------------------------------------------------------- deploy
+  deploy:
+    name: ${{ inputs.environment }} · ${{ matrix.name }}
+    needs: approval
+    if: always() && (needs.approval.result == 'success' || needs.approval.result == 'skipped')
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: 60
+    environment:
+      name: ${{ inputs.environment }}
+      url: ${{ steps.deploy.outputs.url }}
+    concurrency:
+      group: deploy-${{ github.repository }}-${{ inputs.environment }}-${{ matrix.name }}
+      cancel-in-progress: false
+    strategy:
+      fail-fast: true
+      max-parallel: 1               # components deploy one after another (database before APIs if listed first)
+      matrix: ${{ fromJSON(inputs.matrix) }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: pkg-${{ matrix.name }}
+          path: ${{ runner.temp }}/pkg
+
+      - name: Deploy
+        id: deploy
+        uses: mmamdouhDevops/pipeline-templates/actions/deploy@v1
+        with:
+          component: ${{ toJSON(matrix) }}
+          version: ${{ inputs.version }}
+          environment: ${{ inputs.environment }}
+          package-dir: ${{ runner.temp }}/pkg
+        env:
+          # ---- topology (environment variables) ----
+          DEPLOY_MODE: ${{ vars.DEPLOY_MODE }}
+          WEB_HOSTS: ${{ vars.WEB_HOSTS }}
+          API_HOSTS: ${{ vars.API_HOSTS }}
+          INTEGRATION_HOSTS: ${{ vars.INTEGRATION_HOSTS }}
+          DB_HOSTS: ${{ vars.DB_HOSTS }}
+          AI_HOSTS: ${{ vars.AI_HOSTS }}
+          DEPLOY_SSH_USER: ${{ vars.DEPLOY_SSH_USER }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_SSH_KNOWN_HOSTS: ${{ vars.DEPLOY_SSH_KNOWN_HOSTS }}
+          TLS_CERT: ${{ vars.TLS_CERT }}
+          TLS_KEY: ${{ vars.TLS_KEY }}
+          # ---- database (runner tasks) ----
+          DB_SERVER: ${{ vars.DB_SERVER }}
+          DB_ADMIN_USER: ${{ secrets.DB_ADMIN_USER }}
+          DB_ADMIN_PASSWORD: ${{ secrets.DB_ADMIN_PASSWORD }}
+          DB_BACKUP_DIR: ${{ vars.DB_BACKUP_DIR }}
+          DB_BACKUP_KEEP: ${{ vars.DB_BACKUP_KEEP }}
+          DB_NAME: ${{ vars[matrix.db_name_var] }}
+          DB_CONNECTION: ${{ secrets[format('DB_CONNECTION__{0}', matrix.slug)] }}
+          # ---- component configuration (per component slug) ----
+          PUBLIC_URL: ${{ vars[matrix.public_url_var] }}
+          SERVER_NAME: ${{ vars[matrix.server_name_var] }}
+          APP_ENV_FILE: ${{ secrets[format('APP_ENV__{0}', matrix.slug)] }}
+          APP_SETTINGS_JSON: ${{ vars[format('APP_SETTINGS__{0}', matrix.slug)] }}
+          MIGRATOR_SETTINGS_JSON: ${{ vars[format('MIGRATOR_SETTINGS__{0}', matrix.slug)] }}
+          RUNTIME_CONFIG_JSON: ${{ vars[format('RUNTIME_CONFIG__{0}', matrix.slug)] }}
+          SHARED_FILES_JSON: ${{ secrets[format('FILES__{0}', matrix.slug)] }}
+          SMOKE_BEARER_TOKEN: ${{ secrets[format('SMOKE_TOKEN__{0}', matrix.slug)] }}
+
+      - name: DAST · OWASP ZAP
+        if: inputs.run_dast && matrix.dast != 'none'
+        uses: mmamdouhDevops/pipeline-templates/actions/dast@v1
+        with:
+          component: ${{ toJSON(matrix) }}
+          target: ${{ vars[matrix.public_url_var] }}
+          fail-on-high: ${{ vars.DAST_FAIL_ON_HIGH != 'false' }}
+        env:
+          DAST_TOKEN_URL: ${{ vars.DAST_TOKEN_URL }}
+          DAST_CLIENT_ID: ${{ secrets.DAST_CLIENT_ID }}
+          DAST_CLIENT_SECRET: ${{ secrets.DAST_CLIENT_SECRET }}
+          DAST_SCOPE: ${{ vars.DAST_SCOPE }}
+          DAST_EXTRA_HOSTS: ${{ vars.DAST_EXTRA_HOSTS }}

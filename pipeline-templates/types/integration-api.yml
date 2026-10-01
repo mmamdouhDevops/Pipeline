@@ -1,0 +1,18 @@
+# Integration API: connects the platform with partner systems. Same runtime as backend-dotnet,
+# plus OpenAPI contract checks in CI and dependency/contract smoke tests after deploy.
+type: integration-api
+description: ".NET integration API: partner config per environment, OpenAPI breaking-change gate, contract smoke tests"
+toolchain: [dotnet]
+ci:
+  build: dotnet
+  sonar: dotnet
+  snyk: dotnet
+  checks: [ef-migrations, openapi-diff]
+  contract: true
+package: dotnet
+cd:
+  runner_tasks: [db-backup, db-migrate]
+  host_tasks:   [install, health]
+  post_tasks:   [smoke, contract-smoke]
+default_role: integration
+dast: api

@@ -1,0 +1,613 @@
+# =============================================================================================
+#  CI entry point (reusable). Consumers call it from .github/workflows/ci.yml on pull_request.
+#  Everything is driven by the consumer's pipeline.yml + types/<type>.yml (see docs/PIPELINE-YML.md).
+#
+#  Stages:  plan → policy → SAST (SonarQube, Checkmarx One, Snyk, gitleaks) → build & unit tests
+#           → type checks (EF migrations / SQL lint / OpenAPI breaking changes) → summary
+#  Required status check for branch rules:  "CI / Summary"
+# =============================================================================================
+name: ci-component
+
+on:
+  workflow_call:
+    inputs:
+      config:
+        description: Path to pipeline.yml
+        type: string
+        default: pipeline.yml
+      runner:
+        description: 'JSON array of runner labels; empty = vars.RUNNER_CI, else ubuntu-latest'
+        type: string
+        default: ""
+      enable_sonar:
+        type: boolean
+        default: true
+      enable_checkmarx:
+        type: boolean
+        default: true
+      enable_snyk:
+        type: boolean
+        default: true
+      enable_gitleaks:
+        type: boolean
+        default: true
+      sonar_pr_decoration:
+        description: SonarQube Developer Edition+ only (PR analysis)
+        type: boolean
+        default: false
+      pr_title_pattern:
+        description: Regex for PR titles (empty = don't check)
+        type: string
+        default: '^(feat|fix|hotfix|release|chore|docs|refactor|test|perf|ci|build)(\([a-z0-9-]+\))?!?: .+'
+      extra_source_branches:
+        description: 'Extra allowed source branch prefixes, comma separated (e.g. "dependabot/")'
+        type: string
+        default: "dependabot/"
+
+env:
+  DOTNET_NOLOGO: "true"
+  DOTNET_CLI_TELEMETRY_OPTOUT: "true"
+  SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+
+jobs:
+  # -------------------------------------------------------------------------------- plan
+  plan:
+    name: Plan
+    runs-on: ${{ fromJSON(inputs.runner != '' && inputs.runner || vars.RUNNER_CI || '["ubuntu-latest"]') }}
+    timeout-minutes: 5
+    outputs:
+      matrix-build: ${{ steps.plan.outputs.matrix-build }}
+      count-build: ${{ steps.plan.outputs.count-build }}
+      matrix-sonar: ${{ steps.plan.outputs.matrix-sonar }}
+      count-sonar: ${{ steps.plan.outputs.count-sonar }}
+      matrix-snyk: ${{ steps.plan.outputs.matrix-snyk }}
+      count-snyk: ${{ steps.plan.outputs.count-snyk }}
+      matrix-dbcheck: ${{ steps.plan.outputs.matrix-dbcheck }}
+      count-dbcheck: ${{ steps.plan.outputs.count-dbcheck }}
+      matrix-contract: ${{ steps.plan.outputs.matrix-contract }}
+      count-contract: ${{ steps.plan.outputs.count-contract }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: plan
+        uses: mmamdouhDevops/pipeline-templates/actions/plan@v1
+        with:
+          config: ${{ inputs.config }}
+          mode: ci
+          base-ref: ${{ github.base_ref }}
+
+  # -------------------------------------------------------------------------------- policy
+  policy:
+    name: Branch & PR policy
+    runs-on: ${{ fromJSON(inputs.runner != '' && inputs.runner || vars.RUNNER_CI || '["ubuntu-latest"]') }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Source → target branch rules (Git Flow)
+        shell: bash
+        env:
+          BASE: ${{ github.base_ref }}
+          HEAD: ${{ github.head_ref }}
+          EXTRA: ${{ inputs.extra_source_branches }}
+        run: |
+          ok=false
+          case "$BASE" in
+            develop) [[ "$HEAD" =~ ^(feature|hotfix|release)/ ]] && ok=true ;;   # release/hotfix = back-merge
+            main)    [[ "$HEAD" =~ ^(release|hotfix)/ ]] && ok=true ;;
+            *)       echo "::warning::PR targets '$BASE' (not develop/main) – policy not enforced"; ok=true ;;
+          esac
+          IFS=',' read -ra extra <<< "$EXTRA"
+          for p in "${extra[@]}"; do [[ -n "$p" && "$HEAD" == "$p"* && "$BASE" == develop ]] && ok=true; done
+          if ! $ok; then
+            echo "::error::Branch '$HEAD' may not be merged into '$BASE'. Allowed: feature/* hotfix/* release/* → develop; release/* hotfix/* → main"
+            exit 1
+          fi
+          echo "✅ $HEAD → $BASE allowed" >> "$GITHUB_STEP_SUMMARY"
+      - name: Branch name format
+        shell: bash
+        env:
+          HEAD: ${{ github.head_ref }}
+        run: |
+          if [[ "$HEAD" =~ ^(release|hotfix)/ ]] && ! [[ "$HEAD" =~ ^(release|hotfix)/v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::release/hotfix branches must be named release/X.Y.Z or hotfix/X.Y.Z (got $HEAD)"; exit 1
+          fi
+          if [[ "$HEAD" =~ ^feature/ ]] && ! [[ "$HEAD" =~ ^feature/[a-z0-9._-]+$ ]]; then
+            echo "::error::feature branches: feature/<lowercase-name> (got $HEAD)"; exit 1
+          fi
+      - name: PR title
+        if: inputs.pr_title_pattern != ''
+        shell: bash
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+          PATTERN: ${{ inputs.pr_title_pattern }}
+        run: |
+          if ! [[ "$TITLE" =~ $PATTERN ]]; then
+            echo "::error::PR title must match: $PATTERN  (e.g. 'feat(tasks): add kanban')"; exit 1
+          fi
+      - name: CODEOWNERS present
+        shell: bash
+        run: |
+          for f in .github/CODEOWNERS CODEOWNERS docs/CODEOWNERS; do [[ -f $f ]] && exit 0; done
+          echo "::error::CODEOWNERS file is required (.github/CODEOWNERS)"; exit 1
+
+  # -------------------------------------------------------------------------------- SAST: secrets
+  gitleaks:
+    name: SAST · Secrets (gitleaks)
+    if: inputs.enable_gitleaks
+    runs-on: ${{ fromJSON(inputs.runner != '' && inputs.runner || vars.RUNNER_CI || '["ubuntu-latest"]') }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install gitleaks (latest release)
+        shell: bash
+        run: |
+          tag=$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/gitleaks/gitleaks/releases/latest | sed 's#.*/tag/v##')
+          curl -fsSL "https://github.com/gitleaks/gitleaks/releases/download/v${tag}/gitleaks_${tag}_linux_x64.tar.gz" | tar -xz -C "$RUNNER_TEMP" gitleaks
+          "$RUNNER_TEMP/gitleaks" version
+      - name: Scan commits of this PR
+        shell: bash
+        env:
+          BASE: ${{ github.base_ref }}
+        run: |
+          git fetch --no-tags origin "$BASE"
+          "$RUNNER_TEMP/gitleaks" detect --source . --log-opts="origin/${BASE}..HEAD" \
+            --redact --report-format sarif --report-path gitleaks.sarif --exit-code 1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sarif-gitleaks
+          path: gitleaks.sarif
+          if-no-files-found: ignore
+
+  # -------------------------------------------------------------------------------- SAST: SonarQube
+  sonarqube:
+    name: SAST · SonarQube · ${{ matrix.name }}
+    needs: plan
+    if: inputs.enable_sonar && needs.plan.outputs.count-sonar != '0'
+    runs-on: ${{ fromJSON(inputs.runner != '' && inputs.runner || vars.RUNNER_CI || '["ubuntu-latest"]') }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix-sonar) }}
+    env:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # full history: blame + new-code detection
+      - name: Check configuration
+        id: cfg
+        shell: bash
+        run: |
+          if [[ -z "$SONAR_TOKEN" || -z "$SONAR_HOST_URL" ]]; then
+            echo "::warning::SONAR_TOKEN / vars.SONAR_HOST_URL not set – SonarQube skipped"; echo "on=false" >> "$GITHUB_OUTPUT"
+          else echo "on=true" >> "$GITHUB_OUTPUT"; fi
+          pr=""
+          if [[ "${{ inputs.sonar_pr_decoration }}" == "true" ]]; then
+            pr="/d:sonar.pullrequest.key=${{ github.event.pull_request.number }} /d:sonar.pullrequest.branch=${{ github.head_ref }} /d:sonar.pullrequest.base=${{ github.base_ref }}"
+          fi
+          echo "pr_args=$pr" >> "$GITHUB_OUTPUT"
+
+      # ---- .NET
+      - if: steps.cfg.outputs.on == 'true' && matrix.ci_sonar == 'dotnet'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - if: steps.cfg.outputs.on == 'true' && matrix.ci_sonar == 'dotnet'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ matrix.dotnet_version }}
+      - name: Sonar scan (.NET) – begin, build, test with coverage, end (Quality Gate enforced)
+        if: steps.cfg.outputs.on == 'true' && matrix.ci_sonar == 'dotnet'
+        shell: bash
+        working-directory: ${{ matrix.path }}
+        run: |
+          export PATH="$PATH:$HOME/.dotnet/tools"
+          dotnet tool update --global dotnet-sonarscanner >/dev/null 2>&1 || dotnet tool install --global dotnet-sonarscanner
+          dotnet sonarscanner begin /k:"${{ matrix.sonar_project_key }}" /d:sonar.host.url="$SONAR_HOST_URL" \
+            /d:sonar.token="$SONAR_TOKEN" /d:sonar.qualitygate.wait=true /d:sonar.qualitygate.timeout=600 \
+            /d:sonar.cs.opencover.reportsPaths="**/coverage.opencover.xml" \
+            /d:sonar.exclusions="**/Migrations/**,**/wwwroot/libs/**" ${{ steps.cfg.outputs.pr_args }}
+          dotnet build ${{ matrix.solution }} -c Debug
+          dotnet test ${{ matrix.solution }} --no-build -c Debug --collect:"XPlat Code Coverage" \
+            -- DataCollectionRunSettings.DataCollector.Configuration.Format=opencover
+          dotnet sonarscanner end /d:sonar.token="$SONAR_TOKEN"
+
+      # ---- JavaScript / Angular
+      - if: steps.cfg.outputs.on == 'true' && matrix.ci_sonar == 'js'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node_version }}
+      - name: Unit tests with coverage (Angular)
+        if: steps.cfg.outputs.on == 'true' && matrix.ci_sonar == 'js'
+        shell: bash
+        working-directory: ${{ matrix.path }}
+        run: |
+          npm ci || npm ci --legacy-peer-deps
+          ${{ matrix.test_command != '' && matrix.test_command || 'npx ng test --watch=false --code-coverage --browsers=ChromeHeadless' }}
+      # ---- Python
+      - if: steps.cfg.outputs.on == 'true' && matrix.ci_sonar == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python_version }}
+      - name: Unit tests with coverage (Python)
+        if: steps.cfg.outputs.on == 'true' && matrix.ci_sonar == 'python'
+        shell: bash
+        working-directory: ${{ matrix.path }}
+        run: |
+          pip install -r "${{ matrix.requirements }}" pytest pytest-cov
+          ${{ matrix.test_command != '' && matrix.test_command || 'pytest --cov=. --cov-report=xml:coverage.xml' }}
+      - name: Sonar scan (JS / Python) – Quality Gate enforced
+        if: steps.cfg.outputs.on == 'true' && (matrix.ci_sonar == 'js' || matrix.ci_sonar == 'python')
+        uses: SonarSource/sonarqube-scan-action@v5
+        with:
+          projectBaseDir: ${{ matrix.path }}
+          args: >
+            -Dsonar.projectKey=${{ matrix.sonar_project_key }}
+            -Dsonar.qualitygate.wait=true
+            -Dsonar.javascript.lcov.reportPaths=coverage/**/lcov.info
+            -Dsonar.python.coverage.reportPaths=coverage.xml
+            -Dsonar.exclusions=**/node_modules/**,**/dist/**,**/*.spec.ts
+
+  # -------------------------------------------------------------------------------- SAST: Checkmarx One
+  checkmarx:
+    name: SAST · Checkmarx One
+    if: inputs.enable_checkmarx
+    runs-on: ${{ fromJSON(inputs.runner != '' && inputs.runner || vars.RUNNER_CI || '["ubuntu-latest"]') }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check configuration
+        id: cfg
+        shell: bash
+        env:
+          CX_ID: ${{ secrets.CHECKMARX_CLIENT_ID }}
+        run: |
+          if [[ -z "$CX_ID" || -z "${{ vars.CHECKMARX_BASE_URI }}" ]]; then
+            echo "::warning::Checkmarx One not configured (secrets.CHECKMARX_CLIENT_ID / vars.CHECKMARX_BASE_URI) – skipped"
+            echo "on=false" >> "$GITHUB_OUTPUT"; else echo "on=true" >> "$GITHUB_OUTPUT"; fi
+      - name: Checkmarx One scan (SAST + SCA + IaC)
+        if: steps.cfg.outputs.on == 'true'
+        # Pin to a release SHA after the first successful run (see docs/TOOLS.md)
+        uses: checkmarx/ast-github-action@main
+        with:
+          base_uri: ${{ vars.CHECKMARX_BASE_URI }}
+          cx_tenant: ${{ vars.CHECKMARX_TENANT }}
+          cx_client_id: ${{ secrets.CHECKMARX_CLIENT_ID }}
+          cx_client_secret: ${{ secrets.CHECKMARX_CLIENT_SECRET }}
+          project_name: ${{ github.event.repository.name }}
+          branch: ${{ github.head_ref }}
+          additional_params: >-
+            --scan-types sast,sca,iac-security
+            --threshold "sast-critical=1;sast-high=1;sca-critical=1;sca-high=1;iac-security-high=1"
+            --report-format sarif --output-path . --output-name cx-result
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.cfg.outputs.on == 'true'
+        with:
+          name: sarif-checkmarx
+          path: cx-result*.sarif
+          if-no-files-found: ignore
+      - name: Upload SARIF to GitHub code scanning
+        if: always() && steps.cfg.outputs.on == 'true' && vars.UPLOAD_SARIF == 'true' && hashFiles('cx-result.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: cx-result.sarif
+          category: checkmarx
+
+  # -------------------------------------------------------------------------------- SAST + SCA: Snyk
+  snyk:
+    name: SAST/SCA · Snyk · ${{ matrix.name }}
+    needs: plan
+    if: inputs.enable_snyk && needs.plan.outputs.count-snyk != '0'
+    runs-on: ${{ fromJSON(inputs.runner != '' && inputs.runner || vars.RUNNER_CI || '["ubuntu-latest"]') }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix-snyk) }}
+    env:
+      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check configuration
+        id: cfg
+        shell: bash
+        run: |
+          if [[ -z "$SNYK_TOKEN" ]]; then echo "::warning::SNYK_TOKEN not set – Snyk skipped"; echo "on=false" >> "$GITHUB_OUTPUT"
+          else echo "on=true" >> "$GITHUB_OUTPUT"; fi
+      - uses: actions/setup-node@v4
+        if: steps.cfg.outputs.on == 'true'
+        with:
+          node-version: "24"
+      - uses: actions/setup-dotnet@v4
+        if: steps.cfg.outputs.on == 'true' && matrix.ci_snyk == 'dotnet'
+        with:
+          dotnet-version: ${{ matrix.dotnet_version }}
+      - uses: actions/setup-python@v5
+        if: steps.cfg.outputs.on == 'true' && matrix.ci_snyk == 'python'
+        with:
+          python-version: ${{ matrix.python_version }}
+      - name: Restore dependencies (Snyk reads lock/assets files)
+        if: steps.cfg.outputs.on == 'true'
+        shell: bash
+        working-directory: ${{ matrix.path }}
+        run: |
+          case "${{ matrix.ci_snyk }}" in
+            dotnet) dotnet restore ${{ matrix.solution }} ;;
+            node)   npm ci --ignore-scripts || npm ci --ignore-scripts --legacy-peer-deps ;;
+            python) pip install -r "${{ matrix.requirements }}" ;;
+          esac
+      - name: Snyk Code (SAST), Open Source (SCA), IaC
+        if: steps.cfg.outputs.on == 'true'
+        shell: bash
+        working-directory: ${{ matrix.path }}
+        run: |
+          SNYK="npx --yes snyk@latest"
+          ORG=${{ vars.SNYK_ORG != '' && format('--org={0}', vars.SNYK_ORG) || '' }}
+          rc=0
+          # exit codes: 0 ok, 1 issues found, 2 error, 3 no supported files
+          $SNYK code test $ORG --severity-threshold=high --sarif-file-output=snyk-code.sarif || { c=$?; [[ $c == 3 ]] || rc=$c; }
+          $SNYK test --all-projects $ORG --severity-threshold=high --sarif-file-output=snyk-oss.sarif || { c=$?; [[ $c == 3 ]] || rc=$c; }
+          $SNYK iac test $ORG --severity-threshold=high --sarif-file-output=snyk-iac.sarif || { c=$?; [[ $c == 3 ]] || rc=$c; }
+          # keep Snyk's dashboard up to date for long-lived branches
+          [[ "${{ github.base_ref }}" == "develop" ]] && $SNYK monitor --all-projects $ORG >/dev/null 2>&1 || true
+          exit $rc
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.cfg.outputs.on == 'true'
+        with:
+          name: sarif-snyk-${{ matrix.name }}
+          path: ${{ matrix.path }}/snyk-*.sarif
+          if-no-files-found: ignore
+
+  # -------------------------------------------------------------------------------- build + unit tests
+  build:
+    name: Build & test · ${{ matrix.name }}
+    needs: plan
+    if: needs.plan.outputs.count-build != '0'
+    runs-on: ${{ fromJSON(inputs.runner != '' && inputs.runner || vars.RUNNER_CI || '["ubuntu-latest"]') }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix-build) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        if: contains(matrix.toolchain, 'dotnet')
+        with:
+          dotnet-version: ${{ matrix.dotnet_version }}
+      - uses: actions/setup-node@v4
+        if: contains(matrix.toolchain, 'node')
+        with:
+          node-version: ${{ matrix.node_version }}
+      - uses: actions/setup-python@v5
+        if: contains(matrix.toolchain, 'python')
+        with:
+          python-version: ${{ matrix.python_version }}
+      - name: Cache NuGet
+        if: contains(matrix.toolchain, 'dotnet')
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj', '**/Directory.Packages.props') }}
+          restore-keys: nuget-${{ runner.os }}-
+
+      - name: Build & test (.NET)
+        if: matrix.ci_build == 'dotnet'
+        shell: bash
+        working-directory: ${{ matrix.path }}
+        run: |
+          export PATH="$PATH:$HOME/.dotnet/tools"
+          if [[ "${{ matrix.abp_install_libs }}" == "true" ]]; then
+            dotnet tool update -g Volo.Abp.Studio.Cli >/dev/null 2>&1 || dotnet tool install -g Volo.Abp.Studio.Cli
+            abp install-libs
+          fi
+          dotnet restore ${{ matrix.solution }}
+          dotnet build ${{ matrix.solution }} -c Release --no-restore
+          dotnet test ${{ matrix.solution }} -c Release --no-build \
+            --logger "trx;LogFilePrefix=${{ matrix.name }}" --results-directory "$GITHUB_WORKSPACE/TestResults"
+          if [[ -n "${{ matrix.publish_project }}" ]]; then
+            dotnet publish "${{ matrix.publish_project }}" -c Release -o "$RUNNER_TEMP/publish-check" --no-restore
+          fi
+
+      - name: Build & test (Angular)
+        if: matrix.ci_build == 'angular'
+        shell: bash
+        working-directory: ${{ matrix.path }}
+        run: |
+          npm ci || npm ci --legacy-peer-deps
+          ${{ matrix.build_command != '' && matrix.build_command || 'npx ng build --configuration production' }}
+          ${{ matrix.test_command != '' && matrix.test_command || 'npx ng test --watch=false --browsers=ChromeHeadless' }}
+
+      - name: Build & test (Python)
+        if: matrix.ci_build == 'python'
+        shell: bash
+        working-directory: ${{ matrix.path }}
+        run: |
+          python -m venv .venv && . .venv/bin/activate
+          pip install -r "${{ matrix.requirements }}" pytest
+          python -m compileall -q .
+          ${{ matrix.test_command != '' && matrix.test_command || 'pytest -q --junitxml=$GITHUB_WORKSPACE/TestResults/pytest.xml' }}
+
+      - name: Validate SQL scripts are present (database)
+        if: matrix.ci_build == 'sql'
+        shell: bash
+        working-directory: ${{ matrix.path }}
+        run: ls -1 "${{ matrix.sql_dir }}"/*.sql
+
+      - name: Test summary
+        if: always() && matrix.ci_build == 'dotnet'
+        shell: bash
+        run: |
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import glob, xml.etree.ElementTree as ET
+          t = p = f = 0
+          for path in glob.glob("TestResults/**/*.trx", recursive=True):
+              c = ET.parse(path).getroot().find(".//{*}Counters")
+              if c is not None:
+                  t += int(c.get("total", 0)); p += int(c.get("passed", 0)); f += int(c.get("failed", 0))
+          print(f"### 🧪 ${{ matrix.name }}: {p}/{t} tests passed" + (f", **{f} failed**" if f else ""))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results-${{ matrix.name }}
+          path: TestResults/
+          if-no-files-found: ignore
+
+  # -------------------------------------------------------------------------------- database checks
+  db-checks:
+    name: DB checks · ${{ matrix.name }}
+    needs: plan
+    if: needs.plan.outputs.count-dbcheck != '0'
+    runs-on: ${{ fromJSON(inputs.runner != '' && inputs.runner || vars.RUNNER_CI || '["ubuntu-latest"]') }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix-dbcheck) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Destructive migration guard
+        shell: bash
+        env:
+          BASE: ${{ github.base_ref }}
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: |
+          git fetch --no-tags origin "$BASE"
+          added=$(git diff --name-only --diff-filter=AM "origin/${BASE}...HEAD" -- '${{ matrix.path }}' \
+                  | grep -E '(/Migrations/[^/]+\.cs$|\.sql$)' | grep -vE '(Designer|ModelSnapshot)\.cs$' || true)
+          [[ -z "$added" ]] && { echo "No new migrations/scripts in this PR."; exit 0; }
+          echo "### 🗄️ Migrations / scripts in this PR" >> "$GITHUB_STEP_SUMMARY"
+          echo "$added" | sed 's/^/- /' >> "$GITHUB_STEP_SUMMARY"
+          hits=$(echo "$added" | xargs grep -nEi \
+            'migrationBuilder\.(DropTable|DropColumn|AlterColumn|RenameColumn|RenameTable|DropForeignKey|DropPrimaryKey)|\bDROP\s+(TABLE|COLUMN|DATABASE)\b|\bTRUNCATE\s+TABLE\b|\bALTER\s+TABLE\s+\S+\s+DROP\b' || true)
+          if [[ -n "$hits" ]]; then
+            echo "$hits"
+            if [[ ",$LABELS," == *",destructive-migration,"* ]]; then
+              echo "::warning::Destructive changes approved by label 'destructive-migration'"
+            else
+              echo "::error::Destructive database changes found. Add the PR label 'destructive-migration' after review."; exit 1
+            fi
+          fi
+      - name: SQL script naming (database components)
+        if: matrix.type == 'database'
+        shell: bash
+        working-directory: ${{ matrix.path }}
+        run: |
+          bad=$(ls -1 "${{ matrix.sql_dir }}" | grep -vE '^[0-9]{3,}_[A-Za-z0-9_-]+\.sql$' || true)
+          [[ -z "$bad" ]] || { echo "::error::Scripts must be named NNN_description.sql: $bad"; exit 1; }
+      - uses: actions/setup-dotnet@v4
+        if: matrix.ef_project != ''
+        with:
+          dotnet-version: ${{ matrix.dotnet_version }}
+      - name: Generate idempotent EF migration script (review artifact)
+        if: matrix.ef_project != ''
+        shell: bash
+        working-directory: ${{ matrix.path }}
+        run: |
+          export PATH="$PATH:$HOME/.dotnet/tools"
+          dotnet tool update -g dotnet-ef >/dev/null 2>&1 || dotnet tool install -g dotnet-ef
+          dotnet ef migrations script --idempotent --project "${{ matrix.ef_project }}" -o "$GITHUB_WORKSPACE/migration-${{ matrix.name }}.sql"
+          dotnet ef migrations list --project "${{ matrix.ef_project }}" --no-connect
+      - uses: actions/upload-artifact@v4
+        if: matrix.ef_project != ''
+        with:
+          name: migration-script-${{ matrix.name }}
+          path: migration-${{ matrix.name }}.sql
+
+  # -------------------------------------------------------------------------------- API contract (integration-api)
+  contract:
+    name: Contract · OpenAPI breaking changes · ${{ matrix.name }}
+    needs: plan
+    if: needs.plan.outputs.count-contract != '0'
+    runs-on: ${{ fromJSON(inputs.runner != '' && inputs.runner || vars.RUNNER_CI || '["ubuntu-latest"]') }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix-contract) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ matrix.dotnet_version }}
+      - name: Install oasdiff
+        shell: bash
+        run: |
+          tag=$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/oasdiff/oasdiff/releases/latest | sed 's#.*/tag/v##')
+          curl -fsSL "https://github.com/oasdiff/oasdiff/releases/download/v${tag}/oasdiff_${tag}_linux_amd64.tar.gz" | tar -xz -C "$RUNNER_TEMP" oasdiff
+      - name: Build-time OpenAPI document (head)
+        shell: bash
+        working-directory: ${{ matrix.path }}
+        run: |
+          dotnet build "${{ matrix.publish_project != '' && matrix.publish_project || matrix.solution }}" -c Release
+          cp "${{ matrix.openapi_file }}" "$RUNNER_TEMP/head.json"
+      - name: Build-time OpenAPI document (base branch)
+        id: base
+        shell: bash
+        env:
+          BASE: ${{ github.base_ref }}
+        run: |
+          git fetch --no-tags origin "$BASE"
+          git worktree add "$RUNNER_TEMP/base" "origin/$BASE"
+          cd "$RUNNER_TEMP/base/${{ matrix.path }}"
+          if [[ ! -e "${{ matrix.publish_project != '' && matrix.publish_project || matrix.solution }}" ]]; then
+            echo "Component does not exist on $BASE yet – nothing to compare."; echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          dotnet build "${{ matrix.publish_project != '' && matrix.publish_project || matrix.solution }}" -c Release >/dev/null
+          cp "${{ matrix.openapi_file }}" "$RUNNER_TEMP/base.json"
+      - name: Breaking-change gate
+        if: steps.base.outputs.skip != 'true'
+        shell: bash
+        env:
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: |
+          {
+            echo "### 🔌 API changes (${{ matrix.name }})"
+            "$RUNNER_TEMP/oasdiff" changelog "$RUNNER_TEMP/base.json" "$RUNNER_TEMP/head.json" -f markdown || true
+          } >> "$GITHUB_STEP_SUMMARY"
+          if ! "$RUNNER_TEMP/oasdiff" breaking "$RUNNER_TEMP/base.json" "$RUNNER_TEMP/head.json" --fail-on ERR; then
+            if [[ ",$LABELS," == *",breaking-change,"* ]]; then
+              echo "::warning::Breaking API change accepted via label 'breaking-change' – inform partner consumers."
+            else
+              echo "::error::Breaking API change. Version the endpoint or add label 'breaking-change' after agreement."; exit 1
+            fi
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openapi-${{ matrix.name }}
+          path: ${{ runner.temp }}/head.json
+
+  # -------------------------------------------------------------------------------- summary (required check)
+  summary:
+    name: Summary
+    if: always()
+    needs: [plan, policy, gitleaks, sonarqube, checkmarx, snyk, build, db-checks, contract]
+    runs-on: ${{ fromJSON(inputs.runner != '' && inputs.runner || vars.RUNNER_CI || '["ubuntu-latest"]') }}
+    timeout-minutes: 5
+    steps:
+      - name: Evaluate results
+        shell: bash
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          echo "### ✅ CI summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Job | Result |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          python3 - <<'PY'
+          import json, os, sys
+          r = json.loads(os.environ["RESULTS"])
+          icon = {"success": "✅", "skipped": "⏭️", "failure": "❌", "cancelled": "🚫"}
+          bad = False
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as s:
+              for job, v in r.items():
+                  res = v["result"]
+                  s.write(f"| {job} | {icon.get(res, res)} {res} |\n")
+                  bad |= res in ("failure", "cancelled")
+          sys.exit(1 if bad else 0)
+          PY

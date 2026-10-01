@@ -1,0 +1,42 @@
+# pipeline.yml – one repository, several components. CI only runs components whose folder changed
+# (changes to pipeline.yml or .github/ run everything). CD deploys them in the listed order,
+# so put databases first, then APIs, then the web front-end.
+version: 1
+defaults:
+  dotnet_version: "10.0.x"
+  node_version: "24"
+  keep_releases: 5
+components:
+  - name: reporting-db
+    type: database
+    path: database
+  - name: taskmanager-api
+    type: backend-dotnet
+    path: backend
+    solution: TaskManager.sln
+    publish_project: src/TaskManager.HttpApi.Host/TaskManager.HttpApi.Host.csproj
+    owns_database: true
+    migrator_project: src/TaskManager.DbMigrator/TaskManager.DbMigrator.csproj
+    ef_project: src/TaskManager.EntityFrameworkCore/TaskManager.EntityFrameworkCore.csproj
+    abp_install_libs: true
+    always_run_migrator: true
+    port: 5000
+    health_path: /health-status
+    openapi_path: /swagger/v1/swagger.json
+  - name: integration-api
+    type: integration-api
+    path: integration
+    solution: IntegrationApi.slnx
+    publish_project: src/IntegrationApi/IntegrationApi.csproj
+    openapi_file: src/IntegrationApi/openapi/IntegrationApi.json
+    port: 5010
+    health_path: /health                    # liveness; /health/ready is checked by contract-smoke
+    openapi_path: /openapi/v1.json
+  - name: vlm-service
+    type: ai-service
+    path: ai
+    port: 8000
+  - name: taskmanager-web
+    type: frontend-angular
+    path: frontend
+    health_path: /

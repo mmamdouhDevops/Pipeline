@@ -1,0 +1,17 @@
+# Angular (ABP) static site served by Nginx; runtime settings via /getEnvConfig.
+type: frontend-angular
+description: "Angular production build served by Nginx, environment settings in dynamic-env.json"
+toolchain: [node]
+ci:
+  build: angular
+  sonar: js
+  snyk: node
+  checks: []
+  contract: false
+package: static
+cd:
+  runner_tasks: []
+  host_tasks:   [install, health]
+  post_tasks:   [smoke]
+default_role: web
+dast: web                        # ZAP baseline

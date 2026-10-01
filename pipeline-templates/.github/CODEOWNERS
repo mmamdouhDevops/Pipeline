@@ -1,0 +1,5 @@
+# Changes to the shared pipeline need review by the DevOps owners.
+*                         @mmamdouhDevops
+/.github/workflows/       @mmamdouhDevops
+/actions/                 @mmamdouhDevops
+/scripts/server/          @mmamdouhDevops

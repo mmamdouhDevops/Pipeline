@@ -1,0 +1,37 @@
+name: deploy
+description: >
+  Deploys (or rolls back) one component to one environment.
+  Runner tasks (DB backup, EF migrations via DbMigrator, SQL scripts) run on the deploy runner;
+  host tasks run on every host of the component's server role through /usr/local/sbin/app-deploy
+  (locally when DEPLOY_MODE=local, over SSH otherwise); post tasks (smoke, contract) run from the runner.
+  Environment-specific values arrive as environment variables (see deploy-stage.yml and docs/SECRETS.md).
+inputs:
+  component:
+    description: Component JSON (matrix item from the plan action)
+    required: true
+  version:
+    required: true
+  environment:
+    required: true
+  package-dir:
+    description: Folder containing <name>-<version>.tar.gz and .sha256
+    default: ""
+  action:
+    description: deploy | rollback
+    default: deploy
+outputs:
+  url:
+    value: ${{ steps.run.outputs.url }}
+runs:
+  using: composite
+  steps:
+    - id: run
+      shell: bash
+      env:
+        COMPONENT_JSON: ${{ inputs.component }}
+        VERSION: ${{ inputs.version }}
+        TARGET_ENV: ${{ inputs.environment }}
+        PACKAGE_DIR: ${{ inputs.package-dir }}
+        ACTION: ${{ inputs.action }}
+        ACTION_DIR: ${{ github.action_path }}
+      run: bash "${{ github.action_path }}/deploy.sh"

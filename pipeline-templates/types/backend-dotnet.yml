@@ -1,0 +1,17 @@
+# Backend API (ABP / ASP.NET Core) deployed as a systemd service behind Nginx.
+type: backend-dotnet
+description: ".NET API with optional EF Core database (DbMigrator), systemd + Nginx reverse proxy"
+toolchain: [dotnet, node]        # node: ABP install-libs (wwwroot/libs)
+ci:
+  build: dotnet
+  sonar: dotnet
+  snyk: dotnet
+  checks: [ef-migrations]        # runs only when owns_database: true
+  contract: false
+package: dotnet                  # publish app (+ DbMigrator when owns_database)
+cd:
+  runner_tasks: [db-backup, db-migrate]      # executed on the deploy runner (needs DB network access)
+  host_tasks:   [install, health]            # executed on every host of the server role (rolling)
+  post_tasks:   [smoke]                      # executed from the runner against the public URL
+default_role: api
+dast: api                        # ZAP API scan from OpenAPI

@@ -1,0 +1,19 @@
+# pipeline.yml – TaskManager-frontend (Angular 22 + ABP UI, served by Nginx)
+version: 1
+components:
+  - name: taskmanager-web
+    type: frontend-angular
+    path: .
+    node_version: "24"
+    # angular_dist: dist/TaskManager/browser   # auto-detected (folder containing index.html)
+    build_command: npx ng build --configuration production
+    # Karma needs Chrome on the runner (CHROME_BIN); Vitest-based projects: npx ng test --watch=false
+    test_command: npx ng test --watch=false --browsers=ChromeHeadless
+    health_path: /
+    deploy_path: /var/www/taskmanager-web
+    sonar_project_key: taskmanager-frontend
+# Runtime settings per environment (no rebuild): vars RUNTIME_CONFIG__TASKMANAGER_WEB = dynamic-env.json content
+#   {"production":true,"application":{"baseUrl":"https://taskmanager.example.com","name":"TaskManager"},
+#    "oAuthConfig":{"issuer":"https://api.taskmanager.example.com/","clientId":"TaskManager_App",
+#                   "responseType":"code","scope":"offline_access TaskManager","requireHttps":true},
+#    "apis":{"default":{"url":"https://api.taskmanager.example.com","rootNamespace":"TaskManager"}}}

@@ -1,0 +1,43 @@
+# CD – builds ONLY from release/X.Y.Z and hotfix/X.Y.Z, then test → staging → production,
+# each stage behind the approval of its responsible users.
+name: CD
+
+on:
+  push:
+    branches: ['release/**', 'hotfix/**']
+  workflow_dispatch:
+    inputs:
+      components:
+        description: Components to deploy (comma separated, empty = all in pipeline.yml)
+        type: string
+        default: ""
+      run_dast:
+        description: Run DAST (OWASP ZAP) after the test deployment
+        type: boolean
+        default: true
+      skip_staging:
+        description: EMERGENCY only (needs vars.ALLOW_SKIP_STAGING = true)
+        type: boolean
+        default: false
+
+concurrency:
+  group: cd-${{ github.repository }}-${{ github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write        # tag + GitHub Release
+  pull-requests: write   # merge-back PRs → main / develop
+  issues: write          # approval issues (APPROVAL_MODE=issue)
+  id-token: write        # build provenance attestation (optional)
+  attestations: write
+  actions: read
+
+jobs:
+  CD:
+    uses: mmamdouhDevops/pipeline-templates/.github/workflows/cd-component.yml@v1
+    with:
+      config: pipeline.yml
+      components: ${{ inputs.components || '' }}
+      run_dast: ${{ github.event_name != 'workflow_dispatch' || inputs.run_dast }}
+      skip_staging: ${{ inputs.skip_staging == true }}
+    secrets: inherit

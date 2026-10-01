@@ -1,0 +1,17 @@
+# Standalone database component: ordered SQL scripts (sql/migrations/NNN_*.sql), tracked in __ScriptHistory.
+type: database
+description: "SQL Server scripts: backup, run pending scripts only, verify"
+toolchain: []
+ci:
+  build: sql
+  sonar: none
+  snyk: none
+  checks: [sql-lint]
+  contract: false
+package: sql
+cd:
+  runner_tasks: [db-backup, db-scripts]
+  host_tasks:   []
+  post_tasks:   [db-verify]
+default_role: db
+dast: none

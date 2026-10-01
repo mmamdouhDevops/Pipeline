@@ -1,0 +1,23 @@
+# pipeline.yml – Integration API (connects TaskManager with partner systems)
+version: 1
+components:
+  - name: integration-api
+    type: integration-api
+    path: .
+    solution: IntegrationApi.slnx
+    publish_project: src/IntegrationApi/IntegrationApi.csproj
+    test_projects: "test/**/*Tests.csproj"
+    openapi_file: src/IntegrationApi/openapi/IntegrationApi.json   # generated at build time → contract gate in CI
+    owns_database: false
+    port: 5010
+    health_path: /health              # liveness (used by app-deploy for health/rollback)
+    openapi_path: /openapi/v1.json    # contract smoke + ZAP API scan
+    deploy_path: /var/www/integration-api
+    sonar_project_key: integration-api
+# Per environment:
+#   vars    URL__INTEGRATION_API            https://integration.taskmanager.example.com
+#           SERVER_NAME__INTEGRATION_API    integration.taskmanager.example.com
+#           APP_SETTINGS__INTEGRATION_API   {"Partner":{"BaseUrl":"https://partner-sandbox.example.com/","TimeoutSeconds":15}}
+#   secrets APP_ENV__INTEGRATION_API        Partner__ApiKey=…
+#                                           Inbound__ApiKeys__0=…   (keys our callers send as Bearer / X-Api-Key)
+#           SMOKE_TOKEN__INTEGRATION_API    one of the inbound keys (used by the smoke test)

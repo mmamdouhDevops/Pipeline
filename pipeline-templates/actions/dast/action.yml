@@ -1,0 +1,29 @@
+name: dast
+description: >
+  OWASP ZAP scan of a deployed component (Docker on the runner, host network).
+  web → baseline scan; api → API scan from the OpenAPI document (optionally authenticated with an
+  OAuth2 client-credentials token). Fails on High-risk alerts. Reports uploaded as artifacts.
+inputs:
+  component:
+    required: true
+  target:
+    description: Public base URL of the component in the test environment
+    required: true
+  fail-on-high:
+    default: "true"
+runs:
+  using: composite
+  steps:
+    - id: zap
+      shell: bash
+      env:
+        COMPONENT_JSON: ${{ inputs.component }}
+        TARGET: ${{ inputs.target }}
+        FAIL_ON_HIGH: ${{ inputs.fail-on-high }}
+      run: bash "${{ github.action_path }}/dast.sh"
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: dast-${{ fromJSON(inputs.component).name }}
+        path: ${{ runner.temp }}/zap-${{ fromJSON(inputs.component).name }}/
+        if-no-files-found: ignore

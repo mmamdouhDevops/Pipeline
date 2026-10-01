@@ -1,0 +1,9 @@
+bin/
+obj/
+TestResults/
+*.user
+.vs/
+.idea/
+appsettings.*.local.json
+.env
+# the build-time OpenAPI document IS committed (src/IntegrationApi/openapi/) – it is the contract

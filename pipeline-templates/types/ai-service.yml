@@ -1,0 +1,17 @@
+# AI / VLM service (Python). Deployed as systemd service with a virtualenv; model files verified by checksum.
+type: ai-service
+description: "Python (FastAPI) service + model files on the AI/GPU server"
+toolchain: [python]
+ci:
+  build: python
+  sonar: python
+  snyk: python
+  checks: []
+  contract: false
+package: python
+cd:
+  runner_tasks: []
+  host_tasks:   [install, health]
+  post_tasks:   [smoke]
+default_role: ai
+dast: api
