@@ -12,6 +12,7 @@ Never commit any of these; `scripts/setup-repo.sh` prints the list for a given `
 | `RUNNER_DEPLOY_TEST` / `_STAGING` / `_PRODUCTION` | var | deploy jobs | `["self-hosted","linux","env-test"]` … |
 | `APPROVAL_MODE` | var | stages | `environment` (default) · `issue` · `none` |
 | `APPROVERS_TEST` / `_STAGING` / `_PRODUCTION` | var | issue mode | `alice,bob` (production needs 2 approvals) |
+| `PRODUCTION_ENABLED` | var | CD | `false` (default) → CD ends after staging with an `-rc` pre-release; `true` → production stage |
 | `ALLOW_SKIP_STAGING` | var | CD | `true` only during an incident |
 | `ATTEST_BUILDS` | var | CD build | `true` → build provenance attestation (public repos / Enterprise) |
 | `UPLOAD_SARIF` | var | CI | `true` → SARIF to code scanning (public repos / GitHub Advanced Security) |

@@ -19,6 +19,37 @@ journalctl -u taskmanager-api -n 200 --no-pager
 tail -f /var/www/taskmanager-api/shared/Logs/logs.txt
 ```
 
+## Check an environment
+
+On one server: `sudo app-deploy check` (all roles) or `sudo app-deploy check web,api,db,ci`.
+For a whole environment from GitHub: *Actions › Environment check › test|staging|production* – runs on that
+environment's runner, checks the runner, SSHes to every server of every role, tests the SQL login and writes
+a table to the run summary. Run it after preparing servers, before the first deployment and on a schedule.
+
+| Role | What is checked |
+|---|---|
+| all | Ubuntu 24.04, app-deploy version, sudo allow-list, NTP, ufw, free disk on /var, free memory, deployed apps running |
+| web / api / integration / ai | Nginx installed, running, `nginx -t`; TLS cert present and > 21 days valid |
+| api / integration | ASP.NET Core 10 runtime |
+| ai | python3-venv, NVIDIA GPU (warning only) |
+| db | SQL Server running (service or Docker), backup directory + free space |
+| ci (runner) | .NET 10 SDK, Node 24, Docker (DAST), sqlcmd, python3-yaml, runner service |
+| from runner | SSH to every host as `deploy`, SQL login with `DB_ADMIN_USER` |
+
+## Re-run a failed stage
+
+| Situation | What to do |
+|---|---|
+| Preflight said *not ready* (service stopped, disk full, cert expired, SSH key …) | fix the server → **Re-run failed jobs** in the same run (nothing was changed before the check) |
+| Deploy step failed for an infrastructure reason | fix → **Re-run failed jobs** – same package, install is repeatable, backup runs again |
+| Approval issue timed out / denied by mistake | **Re-run failed jobs** → a new approval issue |
+| Run too old to re-run, or start again from staging | *Actions › CD › Run workflow* on the release branch: `version` = `X.Y.Z-b<n>` (or the Build run id), `start_stage` = `test`/`staging` (staging only if this commit was deployed to test successfully) |
+| Build stopped at the SAST gate | the branch head did not come from a PR with a green CI and 2 approvals → merge changes through PRs, or give `sast_run_id` of the successful CI run |
+| Code bug | PR into `release/X.Y.Z` → merge → **Build** again (new build number) |
+
+Re-runs keep the run's artifacts. With `APPROVAL_MODE=environment` a re-run deploy job asks the reviewers again;
+with `APPROVAL_MODE=issue` the approval already given for that stage stays valid when only the deploy job is re-run.
+
 ## Deployment failed – what now?
 
 | Symptom in the run | Meaning | Action |

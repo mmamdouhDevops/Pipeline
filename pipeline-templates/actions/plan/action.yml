@@ -16,6 +16,12 @@ inputs:
   base-ref:
     description: Base branch for change detection (CI)
     default: ""
+  ref-name:
+    description: Branch being built (empty = github.ref_name)
+    default: ""
+  release:
+    description: "'true' = release build: branch must be release/X.Y.Z or hotfix/X.Y.Z"
+    default: "false"
 outputs:
   matrix:
     description: '{"include":[ ...components... ]}'
@@ -65,6 +71,9 @@ outputs:
   channel:
     description: release | hotfix
     value: ${{ steps.plan.outputs.channel }}
+  release:
+    description: "true when this run is a release build (push to release/X.Y.Z or hotfix/X.Y.Z)"
+    value: ${{ steps.plan.outputs.release }}
 runs:
   using: composite
   steps:
@@ -83,8 +92,10 @@ runs:
         PLAN_ONLY: ${{ inputs.components }}
         PLAN_BASE: ${{ inputs.base-ref }}
         PLAN_TYPES_DIR: ${{ github.action_path }}/../../types
-        PLAN_REF_NAME: ${{ github.ref_name }}
+        PLAN_REF_NAME: ${{ inputs.ref-name != '' && inputs.ref-name || github.ref_name }}
+        PLAN_RELEASE: ${{ inputs.release }}
         PLAN_HEAD_REF: ${{ github.head_ref }}
         PLAN_RUN_NUMBER: ${{ github.run_number }}
+        PLAN_EVENT: ${{ github.event_name }}
         PLAN_REPO: ${{ github.event.repository.name }}
       run: python3 "${{ github.action_path }}/plan.py"

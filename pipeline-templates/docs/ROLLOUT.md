@@ -196,9 +196,30 @@ ChromeHeadless missing for Angular tests (`sudo apt-get install -y chromium-brow
 git checkout develop && git pull
 git checkout -b release/1.0.0 && git push -u origin release/1.0.0
 ```
-The push starts **CD**: plan (version `1.0.0-b<run>`) → build once (package, SBOM, sha256, artifact) →
-**test** approval → DB backup → DbMigrator/SQL scripts → install on the role hosts (health check,
-automatic rollback) → smoke/contract tests → **DAST**. Staging waits for its approval.
+Creating the branch builds nothing. Every change in it already passed **stage 1 – CI SAST** as a pull request
+(feature/* → develop, `CI / Summary` green, 2 approvals).
+
+**Stage 2 – Build (manual):** *Actions › Build › Run workflow* → *Use workflow from* `release/1.0.0` →
+`branch` empty, `sast_run_id` empty → Run.
+1. plan – branch must be `release/X.Y.Z` / `hotfix/X.Y.Z`; version `1.0.0-b<run>`
+2. **SAST gate** – finds the PR that produced the branch head and its successful **CI** run (or uses the given
+   `sast_run_id`), checks that the scanned code is part of the branch and that the PR had **2 approvals**.
+   No proof → nothing is built.
+3. build & unit tests → **package** → artifacts of the run:
+   * `pkg-<component>` – tar.gz + sha256 + SBOM
+   * `db-<component>` – only when the DB changed since the last release tag: changed files, `delta.sql`
+     (EF Core, idempotent, from the last released migration) or the new `NNN_*.sql` scripts
+   * `release-manifest` – version, branch, commit, CI SAST run, components, DB changes
+4. The summary shows: **Deploy: Actions › CD › Run workflow on `release/1.0.0` with version `1.0.0-b<n>`**.
+
+**CD (manual):** *Actions › CD › Run workflow* → *Use workflow from* `release/1.0.0` → `version` = `1.0.0-b<n>`
+(or `artifact_run_id`) → `start_stage` = `test`. For each stage: approval → **preflight** (environment ready?
+otherwise stop) → DB backup → DbMigrator/SQL scripts → install on the role hosts (health check, automatic
+rollback) → smoke/contract tests → **DAST** (test). Staging waits for its approval.
+
+A stage failed? Fix the cause (server, secret, …) and press **Re-run failed jobs** in the CD run – the same
+artifacts are deployed again. Code bug? PR into the release branch (CI SAST + 2 approvals) → merge → **Build**
+again (new version) → **CD** with the new version.
 
 ✅ Check: `sudo app-deploy status` on the VM, open `https://taskmanager.local`, read the run summary
 (steps table + ZAP report artifact).
@@ -260,6 +281,12 @@ Repeat for **production** with its own key, hosts and secrets. Several hosts per
 ---
 
 ## 8. Production and release closing
+
+> **Current scope: test + staging.** With `PRODUCTION_ENABLED=false` (set by `setup-repo.sh`) CD ends after
+> staging and publishes the approved packages as pre-release `vX.Y.Z-rc.<run>`. Whether production is deployed
+> from this repository or delivered to the client's GitHub account is decided later; then set
+> `PRODUCTION_ENABLED=true` (or add the delivery stage).
+
 
 Approve **production** (2 approvers; with `APPROVAL_MODE=environment` the wait timer runs first).
 After success the pipeline:

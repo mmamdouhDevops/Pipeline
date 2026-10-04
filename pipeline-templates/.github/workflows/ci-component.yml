@@ -1,10 +1,18 @@
 # =============================================================================================
-#  CI entry point (reusable). Consumers call it from .github/workflows/ci.yml on pull_request.
-#  Everything is driven by the consumer's pipeline.yml + types/<type>.yml (see docs/PIPELINE-YML.md).
+#  CI component (reusable) – two stages, selected with input `stage`:
 #
-#  Stages:  plan → policy → SAST (SonarQube, Checkmarx One, Snyk, gitleaks) → build & unit tests
-#           → type checks (EF migrations / SQL lint / OpenAPI breaking changes) → summary
-#  Required status check for branch rules:  "CI / Summary"
+#  stage: sast   (ci.yml – automatic on every pull request, e.g. feature/* → develop, 2 reviewers)
+#     plan → policy → SAST: gitleaks · SonarQube · Checkmarx One · Snyk → SAST gate
+#     → unit tests + EF / SQL / OpenAPI checks → summary  ("CI / Summary" = required status check)
+#     No artifacts.
+#
+#  stage: build  (build.yml – MANUAL, input: release/X.Y.Z or hotfix/X.Y.Z)
+#     plan (branch + version X.Y.Z-b<run>) → SAST gate = PROOF that the CI SAST stage succeeded for the
+#     code on that branch (the PR that produced the branch head, or a given sast_run_id; approvals counted)
+#     → build & unit tests → package → artifact pkg-<component>
+#     → DB changes since the last release → artifact db-<component>
+#     → release-manifest (version, branch, commit, SAST run, DB changes) → input of CD
+#  Driven by the consumer's pipeline.yml + types/<type>.yml (see docs/PIPELINE-YML.md).
 # =============================================================================================
 name: ci-component
 
@@ -43,6 +51,48 @@ on:
         description: 'Extra allowed source branch prefixes, comma separated (e.g. "dependabot/")'
         type: string
         default: "dependabot/"
+      ref:
+        description: Branch to check out and build (empty = the branch/PR that triggered the run)
+        type: string
+        default: ""
+      stage:
+        description: "sast = pull-request stage · build = manual release build (release/X.Y.Z | hotfix/X.Y.Z)"
+        type: string
+        default: sast
+      sast_run_id:
+        description: "build stage: id of the successful CI SAST run to rely on (empty = find it from the PR that produced the branch head)"
+        type: string
+        default: ""
+      ci_workflow_name:
+        description: Name of the consumer's CI (SAST) workflow
+        type: string
+        default: CI
+      required_approvals:
+        description: "build stage: approvals the PR behind the SAST run must have"
+        type: number
+        default: 2
+      db_base_ref:
+        description: Compare DB changes against this ref (empty = latest v* tag, else origin/main)
+        type: string
+        default: ""
+      artifact_retention_days:
+        description: Retention of release packages (GitHub artifacts)
+        type: number
+        default: 30
+    outputs:
+      release:
+        description: "'true' when release packages were published by this run"
+        value: ${{ jobs.release-manifest.outputs.published }}
+      version:
+        value: ${{ jobs.plan.outputs.version }}
+      semver:
+        value: ${{ jobs.plan.outputs.semver }}
+      channel:
+        value: ${{ jobs.plan.outputs.channel }}
+      branch:
+        value: ${{ jobs.plan.outputs.branch }}
+      sha:
+        value: ${{ jobs.plan.outputs.sha }}
 
 env:
   DOTNET_NOLOGO: "true"
@@ -66,9 +116,17 @@ jobs:
       count-dbcheck: ${{ steps.plan.outputs.count-dbcheck }}
       matrix-contract: ${{ steps.plan.outputs.matrix-contract }}
       count-contract: ${{ steps.plan.outputs.count-contract }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+      release: ${{ steps.plan.outputs.release }}
+      version: ${{ steps.plan.outputs.version }}
+      semver: ${{ steps.plan.outputs.semver }}
+      channel: ${{ steps.plan.outputs.channel }}
+      branch: ${{ steps.head.outputs.branch }}
+      sha: ${{ steps.head.outputs.sha }}
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.ref }}
           fetch-depth: 0
       - id: plan
         uses: mmamdouhDevops/pipeline-templates/actions/plan@v1
@@ -76,14 +134,25 @@ jobs:
           config: ${{ inputs.config }}
           mode: ci
           base-ref: ${{ github.base_ref }}
+          ref-name: ${{ inputs.ref }}
+          release: ${{ inputs.stage == 'build' }}
+      - name: Commit being built
+        id: head
+        shell: bash
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "branch=${{ inputs.ref != '' && inputs.ref || github.head_ref || github.ref_name }}" >> "$GITHUB_OUTPUT"
 
   # -------------------------------------------------------------------------------- policy
   policy:
     name: Branch & PR policy
+    if: github.event_name == 'pull_request'
     runs-on: ${{ fromJSON(inputs.runner != '' && inputs.runner || vars.RUNNER_CI || '["ubuntu-latest"]') }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
       - name: Source → target branch rules (Git Flow)
         shell: bash
         env:
@@ -134,12 +203,13 @@ jobs:
   # -------------------------------------------------------------------------------- SAST: secrets
   gitleaks:
     name: SAST · Secrets (gitleaks)
-    if: inputs.enable_gitleaks
+    if: inputs.stage == 'sast' && inputs.enable_gitleaks
     runs-on: ${{ fromJSON(inputs.runner != '' && inputs.runner || vars.RUNNER_CI || '["ubuntu-latest"]') }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.ref }}
           fetch-depth: 0
       - name: Install gitleaks (latest release)
         shell: bash
@@ -147,26 +217,32 @@ jobs:
           tag=$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/gitleaks/gitleaks/releases/latest | sed 's#.*/tag/v##')
           curl -fsSL "https://github.com/gitleaks/gitleaks/releases/download/v${tag}/gitleaks_${tag}_linux_x64.tar.gz" | tar -xz -C "$RUNNER_TEMP" gitleaks
           "$RUNNER_TEMP/gitleaks" version
-      - name: Scan commits of this PR
+      - name: Scan commits of this PR / files of the release branch
         shell: bash
         env:
           BASE: ${{ github.base_ref }}
         run: |
-          git fetch --no-tags origin "$BASE"
-          "$RUNNER_TEMP/gitleaks" detect --source . --log-opts="origin/${BASE}..HEAD" \
-            --redact --report-format sarif --report-path gitleaks.sarif --exit-code 1
+          if [[ -n "$BASE" ]]; then
+            git fetch --no-tags origin "$BASE"
+            "$RUNNER_TEMP/gitleaks" detect --source . --log-opts="origin/${BASE}..HEAD" \
+              --redact --report-format sarif --report-path gitleaks.sarif --exit-code 1
+          else   # release build: scan the whole tree that will be shipped
+            "$RUNNER_TEMP/gitleaks" detect --source . --no-git \
+              --redact --report-format sarif --report-path gitleaks.sarif --exit-code 1
+          fi
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: sarif-gitleaks
           path: gitleaks.sarif
           if-no-files-found: ignore
+          overwrite: true
 
   # -------------------------------------------------------------------------------- SAST: SonarQube
   sonarqube:
     name: SAST · SonarQube · ${{ matrix.name }}
     needs: plan
-    if: inputs.enable_sonar && needs.plan.outputs.count-sonar != '0'
+    if: inputs.stage == 'sast' && inputs.enable_sonar && needs.plan.outputs.count-sonar != '0'
     runs-on: ${{ fromJSON(inputs.runner != '' && inputs.runner || vars.RUNNER_CI || '["ubuntu-latest"]') }}
     timeout-minutes: 40
     strategy:
@@ -177,6 +253,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.ref }}
           fetch-depth: 0          # full history: blame + new-code detection
       - name: Check configuration
         id: cfg
@@ -186,7 +263,7 @@ jobs:
             echo "::warning::SONAR_TOKEN / vars.SONAR_HOST_URL not set – SonarQube skipped"; echo "on=false" >> "$GITHUB_OUTPUT"
           else echo "on=true" >> "$GITHUB_OUTPUT"; fi
           pr=""
-          if [[ "${{ inputs.sonar_pr_decoration }}" == "true" ]]; then
+          if [[ "${{ inputs.sonar_pr_decoration }}" == "true" && "${{ github.event_name }}" == "pull_request" ]]; then
             pr="/d:sonar.pullrequest.key=${{ github.event.pull_request.number }} /d:sonar.pullrequest.branch=${{ github.head_ref }} /d:sonar.pullrequest.base=${{ github.base_ref }}"
           fi
           echo "pr_args=$pr" >> "$GITHUB_OUTPUT"
@@ -256,11 +333,13 @@ jobs:
   # -------------------------------------------------------------------------------- SAST: Checkmarx One
   checkmarx:
     name: SAST · Checkmarx One
-    if: inputs.enable_checkmarx
+    if: inputs.stage == 'sast' && inputs.enable_checkmarx
     runs-on: ${{ fromJSON(inputs.runner != '' && inputs.runner || vars.RUNNER_CI || '["ubuntu-latest"]') }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
       - name: Check configuration
         id: cfg
         shell: bash
@@ -280,7 +359,7 @@ jobs:
           cx_client_id: ${{ secrets.CHECKMARX_CLIENT_ID }}
           cx_client_secret: ${{ secrets.CHECKMARX_CLIENT_SECRET }}
           project_name: ${{ github.event.repository.name }}
-          branch: ${{ github.head_ref }}
+          branch: ${{ github.head_ref || github.ref_name }}
           additional_params: >-
             --scan-types sast,sca,iac-security
             --threshold "sast-critical=1;sast-high=1;sca-critical=1;sca-high=1;iac-security-high=1"
@@ -291,6 +370,7 @@ jobs:
           name: sarif-checkmarx
           path: cx-result*.sarif
           if-no-files-found: ignore
+          overwrite: true
       - name: Upload SARIF to GitHub code scanning
         if: always() && steps.cfg.outputs.on == 'true' && vars.UPLOAD_SARIF == 'true' && hashFiles('cx-result.sarif') != ''
         uses: github/codeql-action/upload-sarif@v3
@@ -302,7 +382,7 @@ jobs:
   snyk:
     name: SAST/SCA · Snyk · ${{ matrix.name }}
     needs: plan
-    if: inputs.enable_snyk && needs.plan.outputs.count-snyk != '0'
+    if: inputs.stage == 'sast' && inputs.enable_snyk && needs.plan.outputs.count-snyk != '0'
     runs-on: ${{ fromJSON(inputs.runner != '' && inputs.runner || vars.RUNNER_CI || '["ubuntu-latest"]') }}
     timeout-minutes: 30
     strategy:
@@ -312,6 +392,8 @@ jobs:
       SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
       - name: Check configuration
         id: cfg
         shell: bash
@@ -361,19 +443,116 @@ jobs:
           name: sarif-snyk-${{ matrix.name }}
           path: ${{ matrix.path }}/snyk-*.sarif
           if-no-files-found: ignore
+          overwrite: true
 
-  # -------------------------------------------------------------------------------- build + unit tests
+  # -------------------------------------------------------------------------------- SAST gate
+  sast-gate:
+    name: SAST gate
+    if: always()
+    needs: [plan, policy, gitleaks, sonarqube, checkmarx, snyk]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+    outputs:
+      sast_run_id: ${{ steps.evidence.outputs.run_id }}
+      sast_pr: ${{ steps.evidence.outputs.pr }}
+    steps:
+      # ---------------- stage sast: did the scanners of THIS run pass?
+      - name: All security scans passed?
+        if: inputs.stage == 'sast'
+        shell: bash
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          r = json.loads(os.environ["RESULTS"])
+          bad = {j: v["result"] for j, v in r.items() if v["result"] in ("failure", "cancelled")}
+          if r["plan"]["result"] != "success": bad["plan"] = r["plan"]["result"]
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as s:
+              s.write("### 🛡️ SAST gate: " + ("❌ blocked – " + ", ".join(f"{k}={v}" for k, v in bad.items()) if bad else "✅ passed") + "\n")
+          sys.exit(1 if bad else 0)
+          PY
+
+      # ---------------- stage build: proof that the CI SAST stage succeeded for this code
+      - uses: actions/checkout@v4
+        if: inputs.stage == 'build'
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+      - name: CI SAST succeeded for this branch?
+        id: evidence
+        if: inputs.stage == 'build'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PLAN_RESULT: ${{ needs.plan.result }}
+          HEAD_SHA: ${{ needs.plan.outputs.sha }}
+          BRANCH: ${{ needs.plan.outputs.branch }}
+          RUN_ID: ${{ inputs.sast_run_id }}
+          CI_NAME: ${{ inputs.ci_workflow_name }}
+          NEED_APPROVALS: ${{ inputs.required_approvals }}
+        run: |
+          set -euo pipefail
+          [[ "$PLAN_RESULT" == "success" ]] || { echo "::error::plan failed"; exit 1; }
+          R="$GITHUB_REPOSITORY"
+          pr=""; run=""
+          if [[ -n "$RUN_ID" ]]; then
+            # ---- explicit CI SAST run
+            j=$(gh api "repos/$R/actions/runs/$RUN_ID")
+            [[ "$(jq -r .name <<<"$j")" == "$CI_NAME" ]]           || { echo "::error::Run $RUN_ID is not a '$CI_NAME' run"; exit 1; }
+            [[ "$(jq -r .event <<<"$j")" == "pull_request" ]]      || { echo "::error::Run $RUN_ID was not a pull-request CI run"; exit 1; }
+            [[ "$(jq -r .conclusion <<<"$j")" == "success" ]]      || { echo "::error::CI SAST run $RUN_ID did not succeed"; exit 1; }
+            scanned=$(jq -r .head_sha <<<"$j")
+            git merge-base --is-ancestor "$scanned" "$HEAD_SHA"    || { echo "::error::The code scanned in run $RUN_ID (${scanned::7}) is not part of $BRANCH"; exit 1; }
+            run="$RUN_ID"; pr=$(jq -r '.pull_requests[0].number // empty' <<<"$j")
+          else
+            # ---- find the merged PR that produced the branch head and its successful CI SAST run
+            while read -r num head; do
+              [[ -z "$num" ]] && continue
+              id=$(gh api "repos/$R/actions/runs?event=pull_request&head_sha=$head&per_page=50" \
+                     -q "[.workflow_runs[] | select(.name==\"$CI_NAME\" and .conclusion==\"success\")][0].id // empty")
+              if [[ -n "$id" ]]; then pr="$num"; run="$id"; break; fi
+            done < <(gh api "repos/$R/commits/$HEAD_SHA/pulls" -q '.[] | select(.merged_at != null) | "\(.number) \(.head.sha)"')
+            if [[ -z "$run" ]]; then
+              echo "::error::No successful '$CI_NAME' (SAST) run found for the pull request behind ${HEAD_SHA::7} on $BRANCH."
+              echo "::error::Changes must reach release/hotfix branches through pull requests – or pass sast_run_id."
+              exit 1
+            fi
+          fi
+          # ---- approvals of that PR (the 2-reviewer rule)
+          if [[ -n "$pr" ]]; then
+            n=$(gh api "repos/$R/pulls/$pr/reviews?per_page=100" \
+                  -q '[.[] | select(.state=="APPROVED" or .state=="CHANGES_REQUESTED" or .state=="DISMISSED")] | group_by(.user.login) | map(last) | map(select(.state=="APPROVED")) | length')
+            (( n >= NEED_APPROVALS )) || { echo "::error::PR #$pr has $n approval(s), $NEED_APPROVALS required"; exit 1; }
+          else
+            n="?"; echo "::warning::Pull request of run $run unknown – approvals not verified"
+          fi
+          echo "run_id=$run" >> "$GITHUB_OUTPUT"; echo "pr=$pr" >> "$GITHUB_OUTPUT"
+          {
+            echo "### 🛡️ SAST gate (build): ✅ CI SAST succeeded"
+            echo "| Branch | Commit | CI SAST run | Pull request | Approvals |"
+            echo "|---|---|---|---|---|"
+            echo "| \`$BRANCH\` | \`${HEAD_SHA::7}\` | [$run]($GITHUB_SERVER_URL/$R/actions/runs/$run) | ${pr:+#$pr} | $n |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # -------------------------------------------------------------------------------- build + unit tests (+ release package)
   build:
-    name: Build & test · ${{ matrix.name }}
-    needs: plan
-    if: needs.plan.outputs.count-build != '0'
+    name: Build · ${{ matrix.name }}
+    needs: [plan, sast-gate]
+    if: always() && needs.sast-gate.result == 'success' && needs.plan.outputs.count-build != '0'
     runs-on: ${{ fromJSON(inputs.runner != '' && inputs.runner || vars.RUNNER_CI || '["ubuntu-latest"]') }}
-    timeout-minutes: 40
+    timeout-minutes: 60
     strategy:
-      fail-fast: false
+      fail-fast: ${{ needs.plan.outputs.release == 'true' }}
       matrix: ${{ fromJSON(needs.plan.outputs.matrix-build) }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
       - uses: actions/setup-dotnet@v4
         if: contains(matrix.toolchain, 'dotnet')
         with:
@@ -456,12 +635,44 @@ jobs:
           name: test-results-${{ matrix.name }}
           path: TestResults/
           if-no-files-found: ignore
+          overwrite: true
+
+      # ---------------- release build only: immutable package for CD
+      - name: Package (release build)
+        id: pkg
+        if: needs.plan.outputs.release == 'true'
+        uses: mmamdouhDevops/pipeline-templates/actions/package@v1
+        with:
+          component: ${{ toJSON(matrix) }}
+          version: ${{ needs.plan.outputs.version }}
+      - name: SBOM (CycloneDX)
+        if: needs.plan.outputs.release == 'true'
+        uses: anchore/sbom-action@v0
+        with:
+          path: ${{ steps.pkg.outputs.staging-dir }}
+          format: cyclonedx-json
+          output-file: dist/${{ matrix.name }}-${{ needs.plan.outputs.version }}.sbom.cdx.json
+          upload-artifact: false
+      - name: Build provenance attestation
+        if: needs.plan.outputs.release == 'true' && vars.ATTEST_BUILDS == 'true'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/${{ matrix.name }}-${{ needs.plan.outputs.version }}.tar.gz
+      - name: Publish package artifact pkg-${{ matrix.name }}
+        if: needs.plan.outputs.release == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkg-${{ matrix.name }}
+          path: dist/
+          retention-days: ${{ inputs.artifact_retention_days }}
+          if-no-files-found: error
+          overwrite: true
 
   # -------------------------------------------------------------------------------- database checks
   db-checks:
     name: DB checks · ${{ matrix.name }}
-    needs: plan
-    if: needs.plan.outputs.count-dbcheck != '0'
+    needs: [plan, sast-gate]
+    if: always() && github.event_name == 'pull_request' && needs.sast-gate.result == 'success' && needs.plan.outputs.count-dbcheck != '0'
     runs-on: ${{ fromJSON(inputs.runner != '' && inputs.runner || vars.RUNNER_CI || '["ubuntu-latest"]') }}
     timeout-minutes: 20
     strategy:
@@ -470,6 +681,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.ref }}
           fetch-depth: 0
       - name: Destructive migration guard
         shell: bash
@@ -518,12 +730,13 @@ jobs:
         with:
           name: migration-script-${{ matrix.name }}
           path: migration-${{ matrix.name }}.sql
+          overwrite: true
 
   # -------------------------------------------------------------------------------- API contract (integration-api)
   contract:
     name: Contract · OpenAPI breaking changes · ${{ matrix.name }}
-    needs: plan
-    if: needs.plan.outputs.count-contract != '0'
+    needs: [plan, sast-gate]
+    if: always() && github.event_name == 'pull_request' && needs.sast-gate.result == 'success' && needs.plan.outputs.count-contract != '0'
     runs-on: ${{ fromJSON(inputs.runner != '' && inputs.runner || vars.RUNNER_CI || '["ubuntu-latest"]') }}
     timeout-minutes: 20
     strategy:
@@ -532,6 +745,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.ref }}
           fetch-depth: 0
       - uses: actions/setup-dotnet@v4
         with:
@@ -582,12 +796,187 @@ jobs:
         with:
           name: openapi-${{ matrix.name }}
           path: ${{ runner.temp }}/head.json
+          overwrite: true
+
+  # -------------------------------------------------------------------------------- DB changes since last release
+  db-delta:
+    name: DB scripts · ${{ matrix.name }}
+    needs: [plan, build]
+    if: always() && needs.plan.outputs.release == 'true' && needs.build.result == 'success' && needs.plan.outputs.count-dbcheck != '0'
+    runs-on: ${{ fromJSON(inputs.runner != '' && inputs.runner || vars.RUNNER_CI || '["ubuntu-latest"]') }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: true
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix-dbcheck) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+      - name: Base of comparison (last release)
+        id: base
+        shell: bash
+        run: |
+          git fetch --tags --force origin >/dev/null 2>&1 || true
+          base="${{ inputs.db_base_ref }}"
+          if [[ -z "$base" ]]; then
+            base=$(git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' --exclude '*-rc*' HEAD 2>/dev/null || true)
+            [[ -n "$base" ]] || { git fetch --no-tags origin main >/dev/null 2>&1 && base=origin/main; } || true
+          fi
+          if [[ -z "$base" ]] || ! git rev-parse -q --verify "$base^{commit}" >/dev/null; then
+            echo "No previous release found – the whole schema is treated as new."; base=""
+          fi
+          echo "ref=$base" >> "$GITHUB_OUTPUT"
+          echo "Comparing DB changes against: ${base:-<nothing>}"
+      - name: Detect changes
+        id: chg
+        shell: bash
+        working-directory: ${{ matrix.path }}
+        env:
+          BASE: ${{ steps.base.outputs.ref }}
+        run: |
+          out="$GITHUB_WORKSPACE/db-out"; mkdir -p "$out"
+          if [[ "${{ matrix.type }}" == "database" ]]; then dir="${{ matrix.sql_dir }}"
+          elif [[ -n "${{ matrix.ef_project }}" ]]; then dir="$(dirname "${{ matrix.ef_project }}")/Migrations"
+          else echo "count=0" >> "$GITHUB_OUTPUT"; echo "No ef_project configured for ${{ matrix.name }} – nothing to compare"; exit 0; fi
+          if [[ -n "$BASE" ]]; then
+            git diff --name-only --diff-filter=AMR "$BASE"...HEAD -- "$dir" | grep -vE '(Designer|ModelSnapshot)\.cs$' > "$out/changes.txt" || true
+          else
+            git ls-files -- "$dir" | grep -vE '(Designer|ModelSnapshot)\.cs$' > "$out/changes.txt" || true
+          fi
+          n=$(grep -c . "$out/changes.txt" || true)
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
+          echo "count=$n" >> "$GITHUB_OUTPUT"
+          echo "### 🗄️ ${{ matrix.name }}: $n DB change(s) since ${BASE:-the beginning}" >> "$GITHUB_STEP_SUMMARY"
+          [[ $n -gt 0 ]] && sed 's/^/- /' "$out/changes.txt" >> "$GITHUB_STEP_SUMMARY" || true
+      - uses: actions/setup-dotnet@v4
+        if: steps.chg.outputs.count != '0' && matrix.ef_project != ''
+        with:
+          dotnet-version: ${{ matrix.dotnet_version }}
+      - name: Delta SQL (EF Core, idempotent, from the last released migration)
+        if: steps.chg.outputs.count != '0' && matrix.ef_project != ''
+        shell: bash
+        working-directory: ${{ matrix.path }}
+        env:
+          BASE: ${{ steps.base.outputs.ref }}
+          DIR: ${{ steps.chg.outputs.dir }}
+        run: |
+          export PATH="$PATH:$HOME/.dotnet/tools"
+          dotnet tool update -g dotnet-ef >/dev/null 2>&1 || dotnet tool install -g dotnet-ef
+          from=""
+          if [[ -n "$BASE" ]]; then
+            from=$(git ls-tree -r --name-only "$BASE" -- "$DIR" | grep -E '/[0-9]{14}_[^/]+\.cs$' \
+                   | grep -vE '\.Designer\.cs$' | sed 's#.*/##; s#\.cs$##' | sort | tail -1 || true)
+          fi
+          echo "Last released migration: ${from:-<none>}"
+          dotnet ef migrations script ${from:+"$from"} --idempotent --project "${{ matrix.ef_project }}" \
+            -o "$GITHUB_WORKSPACE/db-out/delta.sql"
+          dotnet ef migrations list --project "${{ matrix.ef_project }}" --no-connect > "$GITHUB_WORKSPACE/db-out/migrations.txt" || true
+          echo "from=${from}" > "$GITHUB_WORKSPACE/db-out/info.txt"
+      - name: Changed SQL scripts (database type)
+        if: steps.chg.outputs.count != '0' && matrix.type == 'database'
+        shell: bash
+        working-directory: ${{ matrix.path }}
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/db-out/scripts"
+          while read -r f; do [[ -f "$f" ]] && cp "$f" "$GITHUB_WORKSPACE/db-out/scripts/"; done < <(sed "s#^${{ matrix.path }}/##" "$GITHUB_WORKSPACE/db-out/changes.txt")
+          ls -1 "$GITHUB_WORKSPACE/db-out/scripts"
+      - name: README for the DBA
+        if: steps.chg.outputs.count != '0'
+        shell: bash
+        run: |
+          cat > db-out/README.md <<EOF
+          # DB changes – ${{ matrix.name }} ${{ needs.plan.outputs.version }}
+          Branch: ${{ needs.plan.outputs.branch }} @ ${{ needs.plan.outputs.sha }}
+          Compared with: ${{ steps.base.outputs.ref || 'nothing (first release)' }}
+
+          - changes.txt   files changed since the last release
+          - delta.sql     idempotent EF Core script from the last released migration (backend / integration API)
+          - scripts/      new or changed NNN_*.sql scripts (database components)
+
+          The pipeline applies these automatically during deployment (after a verified backup).
+          This artifact is for review and for manual execution only if a DBA requires it.
+          EOF
+      - uses: actions/upload-artifact@v4
+        if: steps.chg.outputs.count != '0'
+        with:
+          name: db-${{ matrix.name }}
+          path: db-out/
+          retention-days: ${{ inputs.artifact_retention_days }}
+          overwrite: true
+
+  # -------------------------------------------------------------------------------- release manifest (CD input)
+  release-manifest:
+    name: Release artifacts · ${{ needs.plan.outputs.version }}
+    needs: [plan, sast-gate, build, db-delta]
+    if: always() && needs.plan.outputs.release == 'true' && needs.build.result == 'success' && (needs.db-delta.result == 'success' || needs.db-delta.result == 'skipped')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+    outputs:
+      published: ${{ steps.m.outputs.published }}
+    steps:
+      - name: Artifacts of this run
+        id: arts
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          names=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" -q '[.artifacts[].name] | join(",")' || true)
+          echo "names=$names" >> "$GITHUB_OUTPUT"
+      - name: Write release-manifest.json
+        id: m
+        shell: bash
+        env:
+          MATRIX: ${{ needs.plan.outputs.matrix }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          SEMVER: ${{ needs.plan.outputs.semver }}
+          CHANNEL: ${{ needs.plan.outputs.channel }}
+          BRANCH: ${{ needs.plan.outputs.branch }}
+          SHA: ${{ needs.plan.outputs.sha }}
+          ARTIFACTS: ${{ steps.arts.outputs.names }}
+          SAST_RUN: ${{ needs.sast-gate.outputs.sast_run_id }}
+          SAST_PR: ${{ needs.sast-gate.outputs.sast_pr }}
+        run: |
+          mkdir -p manifest
+          python3 - <<'PY'
+          import json, os, datetime
+          m = {
+            "repository": os.environ["GITHUB_REPOSITORY"], "branch": os.environ["BRANCH"],
+            "sha": os.environ["SHA"], "version": os.environ["VERSION"], "semver": os.environ["SEMVER"],
+            "channel": os.environ["CHANNEL"], "ci_run_id": os.environ["GITHUB_RUN_ID"],
+            "ci_run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+            "built_at": datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "matrix": json.loads(os.environ["MATRIX"]),
+            "sast_run_id": os.environ.get("SAST_RUN", ""), "sast_pr": os.environ.get("SAST_PR", ""),
+            "db_changes": sorted(a[3:] for a in os.environ.get("ARTIFACTS", "").split(",") if a.startswith("db-")),
+          }
+          json.dump(m, open("manifest/release-manifest.json", "w"), indent=2)
+          names = [c["name"] for c in m["matrix"]["include"]]
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as s:
+              s.write(f"### 📦 Release build {m['version']} ({m['channel']})\n")
+              s.write(f"Branch `{m['branch']}` @ `{m['sha'][:7]}` · CI SAST run {m['sast_run_id']} (PR #{m['sast_pr']})\n\n"
+                      f"**Deploy:** Actions › CD › Run workflow on `{m['branch']}` with version **{m['version']}** (or run id {m['ci_run_id']})\n\n")
+              s.write("| Artifact | Content |\n|---|---|\n")
+              for n in names: s.write(f"| `pkg-{n}` | {n}-{m['version']}.tar.gz + .sha256 + SBOM |\n")
+              for n in m["db_changes"]: s.write(f"| `db-{n}` | DB changes since the last release (delta SQL / scripts) |\n")
+              if not m["db_changes"]: s.write("| – | no DB changes since the last release |\n")
+              s.write("| `release-manifest` | version, branch, sha, components, DB changes |\n")
+          PY
+          echo "published=true" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-manifest
+          path: manifest/release-manifest.json
+          retention-days: ${{ inputs.artifact_retention_days }}
+          overwrite: true
 
   # -------------------------------------------------------------------------------- summary (required check)
   summary:
     name: Summary
     if: always()
-    needs: [plan, policy, gitleaks, sonarqube, checkmarx, snyk, build, db-checks, contract]
+    needs: [plan, policy, gitleaks, sonarqube, checkmarx, snyk, sast-gate, build, db-checks, contract, db-delta, release-manifest]
     runs-on: ${{ fromJSON(inputs.runner != '' && inputs.runner || vars.RUNNER_CI || '["ubuntu-latest"]') }}
     timeout-minutes: 5
     steps:

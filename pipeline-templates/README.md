@@ -13,23 +13,29 @@ flowchart LR
     R -->|PR · CI · 2 approvals| M[main]
     H -->|PR| M
   end
-  subgraph CI["CI (every PR)"]
-    P[plan] --> POL[policy] --> SAST["SAST: SonarQube · Checkmarx One · Snyk · gitleaks"] --> B[build + unit tests] --> C[EF / SQL / OpenAPI checks] --> S[CI / Summary]
+  subgraph CI["CI component"]
+    subgraph S1["Stage 1 · CI SAST – automatic on every PR (feature/* → develop), 2 reviewers"]
+      P[plan] --> POL[policy] --> SAST["SAST: SonarQube · Checkmarx One · Snyk · gitleaks"] --> G{SAST gate} -->|passed| T[unit tests + EF / SQL / OpenAPI checks] --> S[CI / Summary]
+    end
+    subgraph BUILD["Stage 2 · Build – MANUAL, input release/X.Y.Z or hotfix/X.Y.Z"]
+      BP[plan + version X.Y.Z-b&lt;n&gt;] --> EV{"SAST gate: CI SAST run succeeded<br/>+ 2 approvals?"} -->|yes| BB[build + tests] --> PKG["package → pkg-*"] --> DB["DB changes → db-*"] --> MAN[release-manifest]
+    end
   end
-  subgraph CD["CD (push to release/* or hotfix/* only)"]
-    BLD[build once: package + SBOM + sha256] --> T["✋ test (my VM)"] --> DAST[DAST · OWASP ZAP] --> ST["✋ staging (Alibaba)"] --> PR["✋✋ production (Alibaba)"] --> TAG[tag · GitHub Release · back-merge PRs]
+  subgraph CD["CD – MANUAL, inputs: release/hotfix branch + build version (artifacts)"]
+    RES[resolve build] --> TT["✋ test (my VM): preflight → deploy → smoke → DAST"] --> ST["✋ staging (Alibaba): preflight → deploy → smoke"] --> PR["✋✋ production (later)"] --> TAG[tag · GitHub Release · back-merge PRs]
   end
-  R -.push.-> BLD
-  H -.push.-> BLD
+  S -.merged into develop → release branch.-> BP
+  MAN -.Run CD with version.-> RES
 ```
 
 ## What is in here
 
 | Path | Purpose |
 |---|---|
-| `.github/workflows/ci-component.yml` | reusable CI: plan → policy → SAST → build/test → type checks → **`CI / Summary`** |
-| `.github/workflows/cd-component.yml` | reusable CD: build once → test → staging → production → release bookkeeping |
-| `.github/workflows/deploy-stage.yml` | one stage: approval → per component runner tasks → host tasks → post tasks → DAST |
+| `.github/workflows/ci-component.yml` | reusable CI component, 2 stages: **`stage: sast`** (PRs: SAST → gate → tests/checks → `CI / Summary`) and **`stage: build`** (manual, release/hotfix: SAST evidence gate → build → artifacts `pkg-*`, `db-*`, `release-manifest`) |
+| `.github/workflows/cd-component.yml` | reusable CD (manual): inputs *release/hotfix branch* + *build version* (or Build run id) → test → staging → production / hand-off |
+| `.github/workflows/deploy-stage.yml` | one stage: approval → **preflight env check** → download artifact → runner tasks → host tasks → post tasks → DAST |
+| `.github/workflows/env-check.yml` | reusable manual/scheduled readiness check of an environment |
 | `.github/workflows/rollback.yml` | reusable manual rollback |
 | `actions/plan` | reads `pipeline.yml` + `types/*.yml`, builds the matrices, computes the version |
 | `actions/package` | builds the immutable release package (`<name>-<version>.tar.gz` + `.sha256`) |

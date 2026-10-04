@@ -1,0 +1,37 @@
+# =============================================================================================
+#  Readiness check of one environment (runner + all role servers + SQL login).
+#  Run it after preparing servers, before the first deployment, and on a schedule to catch drift
+#  (expired certificates, full disks, stopped services). Nothing is changed on the servers.
+# =============================================================================================
+name: env-check
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        type: string
+        required: true
+
+jobs:
+  check:
+    name: Check ${{ inputs.environment }}
+    runs-on: ${{ fromJSON(inputs.environment == 'test' && (vars.RUNNER_DEPLOY_TEST || '["self-hosted","linux","env-test"]') || inputs.environment == 'staging' && (vars.RUNNER_DEPLOY_STAGING || '["self-hosted","linux","env-staging"]') || (vars.RUNNER_DEPLOY_PRODUCTION || '["self-hosted","linux","env-production"]')) }}
+    timeout-minutes: 15
+    environment: ${{ inputs.environment }}     # needed to read the environment's variables and secrets
+    steps:
+      - uses: mmamdouhDevops/pipeline-templates/actions/env-check@v1
+        with:
+          environment: ${{ inputs.environment }}
+        env:
+          DEPLOY_MODE: ${{ vars.DEPLOY_MODE }}
+          WEB_HOSTS: ${{ vars.WEB_HOSTS }}
+          API_HOSTS: ${{ vars.API_HOSTS }}
+          INTEGRATION_HOSTS: ${{ vars.INTEGRATION_HOSTS }}
+          DB_HOSTS: ${{ vars.DB_HOSTS }}
+          AI_HOSTS: ${{ vars.AI_HOSTS }}
+          DEPLOY_SSH_USER: ${{ vars.DEPLOY_SSH_USER }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_SSH_KNOWN_HOSTS: ${{ vars.DEPLOY_SSH_KNOWN_HOSTS }}
+          DB_SERVER: ${{ vars.DB_SERVER }}
+          DB_ADMIN_USER: ${{ secrets.DB_ADMIN_USER }}
+          DB_ADMIN_PASSWORD: ${{ secrets.DB_ADMIN_PASSWORD }}

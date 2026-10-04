@@ -1,0 +1,55 @@
+# Build (manual) – stage 2 of the CI component.
+#   Actions › Build › Run workflow
+#     Use workflow from: release/1.0.0  (or hotfix/1.0.1)  ← the branch to build
+#     branch:            empty = the branch selected above (or type release/X.Y.Z | hotfix/X.Y.Z)
+#     sast_run_id:       empty = use the successful CI SAST run of the PR that produced the branch head
+#
+#   SAST gate (proof: CI SAST succeeded + 2 approvals) → build & unit tests → package → pkg-<component>
+#   → DB changes since the last release → db-<component> → release-manifest      (GitHub artifacts)
+#   Version: X.Y.Z-b<run number>. Deploy afterwards with "CD" (cd.yml) – input: this version or run id.
+name: Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: release/X.Y.Z or hotfix/X.Y.Z (empty = branch selected in "Use workflow from")
+        type: string
+        default: ""
+      sast_run_id:
+        description: Successful CI SAST run id to rely on (empty = find it automatically)
+        type: string
+        default: ""
+      db_base_ref:
+        description: Compare DB changes against (empty = latest release tag vX.Y.Z, else main)
+        type: string
+        default: ""
+
+run-name: Build ${{ inputs.branch || github.ref_name }}
+
+concurrency:
+  group: build-${{ github.repository }}-${{ inputs.branch || github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  Build:
+    uses: mmamdouhDevops/pipeline-templates/.github/workflows/ci-component.yml@v1
+    permissions:
+      contents: read
+      pull-requests: read      # approvals of the PR behind the SAST run
+      actions: read            # find the CI SAST run, list this run's artifacts
+      security-events: write
+      id-token: write          # build provenance attestation (optional, vars.ATTEST_BUILDS)
+      attestations: write
+    with:
+      config: pipeline.yml
+      stage: build
+      ref: ${{ inputs.branch || github.ref_name }}
+      sast_run_id: ${{ inputs.sast_run_id }}
+      db_base_ref: ${{ inputs.db_base_ref }}
+      ci_workflow_name: CI           # name of ci.yml
+      required_approvals: 2
+    secrets: inherit

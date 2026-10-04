@@ -1,5 +1,7 @@
-# CI – runs on every pull request into develop / main / release/* / hotfix/*.
-# Required status check in the rulesets: "CI / Summary"  (job id CI + template job "Summary").
+# CI – stage 1 "CI SAST": every pull request (feature/* → develop, release|hotfix → main, fixes → release/*)
+#   plan → policy → SAST (gitleaks, SonarQube, Checkmarx One, Snyk) → SAST gate
+#   → unit tests → EF / SQL / OpenAPI checks → "CI / Summary" (required status check, + 2 approvals to merge)
+# Nothing is packaged or deployed here – stage 2 "Build" is started manually (build.yml).
 name: CI
 
 on:
@@ -14,8 +16,8 @@ concurrency:
 permissions:
   contents: read
   pull-requests: read
-  security-events: write   # SARIF upload (only when vars.UPLOAD_SARIF == 'true')
   actions: read
+  security-events: write   # SARIF upload (only when vars.UPLOAD_SARIF == 'true')
 
 jobs:
   CI:
@@ -23,6 +25,5 @@ jobs:
     uses: mmamdouhDevops/pipeline-templates/.github/workflows/ci-component.yml@v1
     with:
       config: pipeline.yml
-      # runner: '["self-hosted","linux","ci"]'   # default: vars.RUNNER_CI
-      # enable_checkmarx: false                  # switch a scanner off per repo if needed
+      stage: sast
     secrets: inherit

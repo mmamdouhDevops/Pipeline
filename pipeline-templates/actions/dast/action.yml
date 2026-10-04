@@ -27,3 +27,4 @@ runs:
         name: dast-${{ fromJSON(inputs.component).name }}
         path: ${{ runner.temp }}/zap-${{ fromJSON(inputs.component).name }}/
         if-no-files-found: ignore
+        overwrite: true

@@ -1,0 +1,22 @@
+# Manual (and optional scheduled) readiness check of an environment – changes nothing.
+name: Environment check
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        type: choice
+        options: [test, staging, production]
+        required: true
+  # schedule:
+  #   - cron: "0 4 * * 1-5"      # weekdays 07:00 Cairo – checks 'test' (see the input default below)
+
+permissions:
+  contents: read
+
+jobs:
+  Check:
+    uses: mmamdouhDevops/pipeline-templates/.github/workflows/env-check.yml@v1
+    with:
+      environment: ${{ inputs.environment || 'test' }}
+    secrets: inherit

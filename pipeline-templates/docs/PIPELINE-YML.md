@@ -80,9 +80,18 @@ dast: api
 | `db-verify` | runner | every packaged script recorded with the same checksum |
 
 ## Version and branches
-* CI: every PR into `develop`, `main`, `release/**`, `hotfix/**`.
-* CD: only `release/X.Y.Z` or `hotfix/X.Y.Z` (optional `v` prefix). Version = `X.Y.Z-b<run number>`;
-  production success tags `vX.Y.Z`.
+* CI stage 1 – **CI SAST** (`ci.yml`, `stage: sast`): every PR into `develop`, `main`, `release/**`, `hotfix/**` –
+  SAST, unit tests, checks; merge needs `CI / Summary` + 2 approvals. No packages.
+* CI stage 2 – **Build** (`build.yml`, `stage: build`, manual): input `release/X.Y.Z` or `hotfix/X.Y.Z` →
+  SAST gate = proof that a CI SAST run succeeded for the PR behind the branch head (or `sast_run_id`) and that the
+  PR had 2 approvals → build → artifacts `pkg-*`, `db-*` (DB changes since the latest `vX.Y.Z` tag, or `main`),
+  `release-manifest`. Feature branches are rejected.
+* **CD** (`cd.yml`, manual): inputs = the release/hotfix branch (*Use workflow from*) + the build `version`
+  (or the Build run id).
+* Version = `X.Y.Z-b<Build run number>` (optional `v` in the branch name). Production success tags `vX.Y.Z`;
+  without production a pre-release `vX.Y.Z-rc.<Build run id>` is created after staging.
+* CD never builds: it deploys the artifacts of a Build run on the same branch and commit (a newer commit on the
+  branch → Build again).
 
 ## Database script rules (`database` type)
 * File names `NNN_description.sql` (`001_…`, `002_…`), never renamed or edited after release

@@ -1,14 +1,30 @@
-# CD – builds ONLY from release/X.Y.Z and hotfix/X.Y.Z, then test → staging → production,
-# each stage behind the approval of its responsible users.
+# CD (manual) – deploy a Build's artifacts: test → staging → (production later)
+#   Actions › CD › Run workflow
+#     Use workflow from: release/1.0.0 (or hotfix/1.0.1) – the branch the build was made from
+#     version:           1.0.0-b14   (shown in the Build run summary)   – or –
+#     artifact_run_id:   the Build run id
+#   Every stage: approval → preflight (environment ready?) → deploy → verify.
+#   A failed stage: fix the cause → "Re-run failed jobs" (same artifacts).
 name: CD
 
 on:
-  push:
-    branches: ['release/**', 'hotfix/**']
   workflow_dispatch:
     inputs:
+      version:
+        description: Build version to deploy, e.g. 1.0.0-b14
+        type: string
+        default: ""
+      artifact_run_id:
+        description: …or the Build run id holding the artifacts
+        type: string
+        default: ""
+      start_stage:
+        description: Stage to start from (staging requires a successful test deployment of this build)
+        type: choice
+        options: [test, staging]
+        default: test
       components:
-        description: Components to deploy (comma separated, empty = all in pipeline.yml)
+        description: Components to deploy (comma separated, empty = all in the build)
         type: string
         default: ""
       run_dast:
@@ -20,24 +36,28 @@ on:
         type: boolean
         default: false
 
+run-name: CD ${{ inputs.version || format('run {0}', inputs.artifact_run_id) }} from ${{ inputs.start_stage }} (${{ github.ref_name }})
+
 concurrency:
   group: cd-${{ github.repository }}-${{ github.ref_name }}
   cancel-in-progress: false
 
 permissions:
-  contents: write        # tag + GitHub Release
-  pull-requests: write   # merge-back PRs → main / develop
-  issues: write          # approval issues (APPROVAL_MODE=issue)
-  id-token: write        # build provenance attestation (optional)
-  attestations: write
-  actions: read
+  contents: write          # tag / GitHub Release
+  pull-requests: write     # merge-back PRs
+  issues: write            # approval issues (APPROVAL_MODE=issue)
+  actions: read            # find the Build run, download its artifacts
+  deployments: read        # promotion guard
 
 jobs:
   CD:
     uses: mmamdouhDevops/pipeline-templates/.github/workflows/cd-component.yml@v1
     with:
-      config: pipeline.yml
-      components: ${{ inputs.components || '' }}
-      run_dast: ${{ github.event_name != 'workflow_dispatch' || inputs.run_dast }}
-      skip_staging: ${{ inputs.skip_staging == true }}
+      release_branch: ${{ github.ref_name }}
+      version: ${{ inputs.version }}
+      artifact_run_id: ${{ inputs.artifact_run_id }}
+      start_stage: ${{ inputs.start_stage }}
+      components: ${{ inputs.components }}
+      run_dast: ${{ inputs.run_dast }}
+      skip_staging: ${{ inputs.skip_staging }}
     secrets: inherit

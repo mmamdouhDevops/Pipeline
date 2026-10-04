@@ -133,14 +133,22 @@ if mode == "ci" and env("PLAN_BASE"):
             matrix = kept
 
 # ---------------------------------------------------------------- CD: branch guard + version
+# ---------------------------------------------------------------- release detection + version
+# A release build is started manually (build workflow) for a release/X.Y.Z or hotfix/X.Y.Z branch:
+# CI packages the components and publishes them as artifacts; CD later deploys exactly those artifacts.
 version = semver = channel = ""
-if mode == "cd":
-    ref = env("PLAN_REF_NAME", "")
-    m = re.fullmatch(r"(release|hotfix)/v?(\d+\.\d+\.\d+)", ref)
-    if not m:
-        fail(f"CD only runs from release/X.Y.Z or hotfix/X.Y.Z branches (got '{ref}')")
+ref = env("PLAN_REF_NAME", "")
+m = re.fullmatch(r"(release|hotfix)/v?(\d+\.\d+\.\d+)", ref)
+if m:
     channel, semver = m.group(1), m.group(2)
     version = f"{semver}-b{env('PLAN_RUN_NUMBER', '0')}"
+elif mode == "cd":
+    fail(f"CD only runs from release/X.Y.Z or hotfix/X.Y.Z branches (got '{ref}')")
+want_release = env("PLAN_RELEASE", "false") == "true"
+if want_release and not m:
+    fail(f"Release builds only from release/X.Y.Z or hotfix/X.Y.Z branches (got '{ref}'). "
+         "Feature branches are built and tested by the pull-request CI; they are not packaged.")
+release = "true" if (want_release and m) else "false"
 
 # ---------------------------------------------------------------- per-job matrices
 # A GitHub matrix can't be filtered at job level, so the plan emits one matrix per job.
@@ -170,3 +178,4 @@ out("any_dast", str(any(m["dast"] != "none" for m in matrix)).lower())
 out("version", version)
 out("semver", semver)
 out("channel", channel)
+out("release", release)

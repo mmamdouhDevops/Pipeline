@@ -1,0 +1,14 @@
+name: env-check
+description: >
+  Readiness check of one environment: the deploy runner itself, every server of every role
+  (via `app-deploy check` over SSH or locally) and the SQL Server login. Fails when anything required is missing.
+inputs:
+  environment:
+    required: true
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        TARGET_ENV: ${{ inputs.environment }}
+      run: bash "${{ github.action_path }}/check.sh"

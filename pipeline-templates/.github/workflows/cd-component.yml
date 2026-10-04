@@ -1,26 +1,46 @@
 # =============================================================================================
-#  CD entry point (reusable). Consumers call it from .github/workflows/cd.yml.
-#  Only release/X.Y.Z and hotfix/X.Y.Z branches are accepted.
+#  CD entry point (reusable, started MANUALLY via cd.yml). Deploys the artifacts of a Build run.
 #
-#   build once (artifact + SBOM + checksum)
-#     → [approval] test     → deploy (db backup, migrations, app) → smoke → DAST
-#     → [approval] staging  → deploy → smoke                       (Alibaba Cloud)
-#     → [approval] production → deploy → smoke → tag + GitHub Release + PRs to main/develop
+#  Inputs  release_branch   release/X.Y.Z or hotfix/X.Y.Z (the branch this run is on)
+#          version          build version, e.g. 1.0.0-b14            ┐ one of them identifies the
+#          artifact_run_id  run id of the Build that holds the artifacts ┘ build artifacts on GitHub
+#
+#  resolve (find the Build run, download release-manifest, validate branch / commit / version)
+#    → TEST     : [approval] → preflight env check → deploy → smoke → DAST        (my VM)
+#    → STAGING  : [approval] → preflight env check → deploy → smoke               (Alibaba Cloud)
+#    → PRODUCTION (vars.PRODUCTION_ENABLED == 'true') → tag + GitHub Release + PRs to main/develop
+#      otherwise  → hand-off pre-release vX.Y.Z-rc.<n> with the staged packages
+#
+#  Nothing is rebuilt here. A failed stage can be repeated with "Re-run failed jobs" in the same run,
+#  or with a new CD run (start_stage = test | staging, same version).
 # =============================================================================================
 name: cd-component
 
 on:
   workflow_call:
     inputs:
-      config:
+      release_branch:
+        description: release/X.Y.Z or hotfix/X.Y.Z
         type: string
-        default: pipeline.yml
-      components:
-        description: Comma-separated component names (empty = all)
+        required: true
+      artifact_run_id:
+        description: Run id of the Build run that holds the artifacts (empty = find it from version)
         type: string
         default: ""
-      build_runner:
-        description: 'JSON labels for the build job; empty = vars.RUNNER_CI, else ubuntu-latest'
+      version:
+        description: Build version X.Y.Z-b<n> (empty = take it from artifact_run_id)
+        type: string
+        default: ""
+      build_workflow:
+        description: File name of the consumer's Build workflow (to find a build by version)
+        type: string
+        default: build.yml
+      start_stage:
+        description: test | staging (staging only when this build already passed test)
+        type: string
+        default: test
+      components:
+        description: Comma-separated component names (empty = all in the release)
         type: string
         default: ""
       run_dast:
@@ -31,99 +51,115 @@ on:
         type: boolean
         default: false
 
-env:
-  DOTNET_NOLOGO: "true"
-  DOTNET_CLI_TELEMETRY_OPTOUT: "true"
-
 jobs:
-  # -------------------------------------------------------------------------------- plan + version
-  plan:
-    name: Plan release
-    runs-on: ${{ fromJSON(inputs.build_runner != '' && inputs.build_runner || vars.RUNNER_CI || '["ubuntu-latest"]') }}
+  # -------------------------------------------------------------------------------- resolve release
+  resolve:
+    name: Resolve release
+    runs-on: ubuntu-latest
     timeout-minutes: 5
-    outputs:
-      matrix: ${{ steps.plan.outputs.matrix }}
-      version: ${{ steps.plan.outputs.version }}
-      semver: ${{ steps.plan.outputs.semver }}
-      channel: ${{ steps.plan.outputs.channel }}
-    steps:
-      - uses: actions/checkout@v4
-      - id: plan
-        uses: mmamdouhDevops/pipeline-templates/actions/plan@v1
-        with:
-          config: ${{ inputs.config }}
-          mode: cd
-          components: ${{ inputs.components }}
-      - name: Release info
-        shell: bash
-        run: |
-          {
-            echo "### 📦 ${{ steps.plan.outputs.channel }} ${{ steps.plan.outputs.version }}"
-            echo "Branch \`${{ github.ref_name }}\` @ \`${GITHUB_SHA::7}\` – components: ${{ steps.plan.outputs.names }}"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-  # -------------------------------------------------------------------------------- build once
-  build:
-    name: Build · ${{ matrix.name }}
-    needs: plan
-    runs-on: ${{ fromJSON(inputs.build_runner != '' && inputs.build_runner || vars.RUNNER_CI || '["ubuntu-latest"]') }}
-    timeout-minutes: 45
     permissions:
+      actions: read
+      deployments: read
       contents: read
-      id-token: write          # artifact attestation (optional)
-      attestations: write
-    strategy:
-      fail-fast: true
-      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    outputs:
+      matrix: ${{ steps.r.outputs.matrix }}
+      version: ${{ steps.r.outputs.version }}
+      semver: ${{ steps.r.outputs.semver }}
+      channel: ${{ steps.r.outputs.channel }}
+      sha: ${{ steps.r.outputs.sha }}
+      run_id: ${{ steps.find.outputs.run_id }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-dotnet@v4
-        if: contains(matrix.toolchain, 'dotnet')
+      - name: Find the Build run
+        id: find
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.artifact_run_id }}
+          VERSION: ${{ inputs.version }}
+          BRANCH: ${{ inputs.release_branch }}
+          WF: ${{ inputs.build_workflow }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$RUN_ID" ]]; then
+            [[ -n "$VERSION" ]] || { echo "::error::Give the build version (X.Y.Z-b<n>) or the Build run id"; exit 1; }
+            [[ "$VERSION" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-b([0-9]+)$ ]] || { echo "::error::version must look like 1.0.0-b14"; exit 1; }
+            n="${BASH_REMATCH[2]}"
+            RUN_ID=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/workflows/$WF/runs?per_page=100" \
+                       -q ".workflow_runs[] | select(.run_number==$n) | .id" | head -1)
+            [[ -n "$RUN_ID" ]] || { echo "::error::No $WF run #$n found – check the version"; exit 1; }
+          fi
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "Build run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$RUN_ID"
+      - name: Download release-manifest
+        uses: actions/download-artifact@v4
         with:
-          dotnet-version: ${{ matrix.dotnet_version }}
-      - uses: actions/setup-node@v4
-        if: contains(matrix.toolchain, 'node')
-        with:
-          node-version: ${{ matrix.node_version }}
-      - uses: actions/setup-python@v5
-        if: contains(matrix.toolchain, 'python')
-        with:
-          python-version: ${{ matrix.python_version }}
-      - name: Package
-        id: pkg
-        uses: mmamdouhDevops/pipeline-templates/actions/package@v1
-        with:
-          component: ${{ toJSON(matrix) }}
-          version: ${{ needs.plan.outputs.version }}
-      - name: SBOM (CycloneDX)
-        uses: anchore/sbom-action@v0
-        with:
-          path: ${{ steps.pkg.outputs.staging-dir }}
-          format: cyclonedx-json
-          output-file: dist/${{ matrix.name }}-${{ needs.plan.outputs.version }}.sbom.cdx.json
-          upload-artifact: false
-      - name: Build provenance attestation
-        if: vars.ATTEST_BUILDS == 'true'
-        uses: actions/attest-build-provenance@v2
-        with:
-          subject-path: dist/${{ matrix.name }}-${{ needs.plan.outputs.version }}.tar.gz
-      - uses: actions/upload-artifact@v4
-        with:
-          name: pkg-${{ matrix.name }}
-          path: dist/
-          retention-days: 30
-          if-no-files-found: error
+          name: release-manifest
+          path: manifest
+          run-id: ${{ steps.find.outputs.run_id }}
+          github-token: ${{ github.token }}
+      - name: Validate and plan
+        id: r
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ inputs.release_branch }}
+          ONLY: ${{ inputs.components }}
+          WANT_VERSION: ${{ inputs.version }}
+          RUN_ID: ${{ steps.find.outputs.run_id }}
+          START: ${{ inputs.start_stage }}
+        run: |
+          set -euo pipefail
+          M=manifest/release-manifest.json
+          [[ "$BRANCH" =~ ^(release|hotfix)/v?[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::release_branch must be release/X.Y.Z or hotfix/X.Y.Z (got $BRANCH)"; exit 1; }
+          [[ "$GITHUB_REF_NAME" == "$BRANCH" ]] || { echo "::error::Run CD on the release branch itself (ref $GITHUB_REF_NAME ≠ $BRANCH) – environments only accept release/* and hotfix/*"; exit 1; }
+          mb=$(jq -r .branch $M); ms=$(jq -r .sha $M); mv=$(jq -r .version $M)
+          [[ "$mb" == "$BRANCH" ]] || { echo "::error::Artifacts of run $RUN_ID were built from $mb, not $BRANCH"; exit 1; }
+          [[ -z "$WANT_VERSION" || "$WANT_VERSION" == "$mv" ]] || { echo "::error::Run $RUN_ID holds $mv, not $WANT_VERSION"; exit 1; }
+          if [[ "$ms" != "$GITHUB_SHA" ]]; then
+            echo "::error::$BRANCH moved on: artifacts are from ${ms::7}, branch head is ${GITHUB_SHA::7}. Run Build for the latest commit and deploy that run."; exit 1
+          fi
+          case "$START" in test|staging) ;; *) echo "::error::start_stage must be test or staging"; exit 1 ;; esac
+          if [[ "$START" == "staging" ]]; then
+            # promotion guard: this commit must already have a successful deployment to test
+            ok=0
+            for id in $(gh api "repos/$GITHUB_REPOSITORY/deployments?environment=test&sha=$ms&per_page=50" -q '.[].id'); do
+              st=$(gh api "repos/$GITHUB_REPOSITORY/deployments/$id/statuses?per_page=1" -q '.[0].state' 2>/dev/null || true)
+              [[ "$st" == "success" ]] && { ok=1; break; }
+            done
+            [[ $ok == 1 ]] || { echo "::error::No successful TEST deployment for ${ms::7} – start from test"; exit 1; }
+          fi
+          python3 - <<'PY'
+          import json, os
+          m = json.load(open("manifest/release-manifest.json"))
+          only = [x.strip() for x in os.environ["ONLY"].split(",") if x.strip()]
+          inc = m["matrix"]["include"]
+          if only:
+              unknown = set(only) - {c["name"] for c in inc}
+              if unknown: raise SystemExit(f"::error::not in this release: {sorted(unknown)}")
+              inc = [c for c in inc if c["name"] in only]
+          with open(os.environ["GITHUB_OUTPUT"], "a") as o:
+              o.write("matrix=" + json.dumps({"include": inc}, separators=(",", ":")) + "\n")
+              for k in ("version", "semver", "channel", "sha"): o.write(f"{k}={m[k]}\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as s:
+              s.write(f"### 🚀 CD {m['channel']} {m['version']}\n")
+              s.write(f"Branch `{m['branch']}` @ `{m['sha'][:7]}` · artifacts from CI run {m['ci_run_id']} · "
+                      f"start: **{os.environ['START']}** · components: {', '.join(c['name'] for c in inc)}\n")
+              dbc = m.get("db_changes", [])
+              s.write(f"DB changes since the last release: {', '.join(dbc) if dbc else 'none'}\n")
+          PY
 
-  # -------------------------------------------------------------------------------- TEST (our servers / my VM)
+  # -------------------------------------------------------------------------------- TEST (my VM)
   test:
     name: Test
-    needs: [plan, build]
+    needs: resolve
+    if: inputs.start_stage == 'test'
     uses: mmamdouhDevops/pipeline-templates/.github/workflows/deploy-stage.yml@v1
     with:
       environment: test
-      version: ${{ needs.plan.outputs.version }}
-      channel: ${{ needs.plan.outputs.channel }}
-      matrix: ${{ needs.plan.outputs.matrix }}
+      version: ${{ needs.resolve.outputs.version }}
+      channel: ${{ needs.resolve.outputs.channel }}
+      matrix: ${{ needs.resolve.outputs.matrix }}
+      artifact_run_id: ${{ needs.resolve.outputs.run_id }}
       runner: ${{ vars.RUNNER_DEPLOY_TEST || '["self-hosted","linux","env-test"]' }}
       run_dast: ${{ inputs.run_dast }}
     secrets: inherit
@@ -131,45 +167,87 @@ jobs:
   # -------------------------------------------------------------------------------- STAGING (Alibaba Cloud)
   staging:
     name: Staging
-    needs: [plan, test]
-    if: ${{ !(inputs.skip_staging && vars.ALLOW_SKIP_STAGING == 'true') }}
+    needs: [resolve, test]
+    if: |
+      always() && needs.resolve.result == 'success' &&
+      (needs.test.result == 'success' || (needs.test.result == 'skipped' && inputs.start_stage == 'staging')) &&
+      !(inputs.skip_staging && vars.ALLOW_SKIP_STAGING == 'true')
     uses: mmamdouhDevops/pipeline-templates/.github/workflows/deploy-stage.yml@v1
     with:
       environment: staging
-      version: ${{ needs.plan.outputs.version }}
-      channel: ${{ needs.plan.outputs.channel }}
-      matrix: ${{ needs.plan.outputs.matrix }}
+      version: ${{ needs.resolve.outputs.version }}
+      channel: ${{ needs.resolve.outputs.channel }}
+      matrix: ${{ needs.resolve.outputs.matrix }}
+      artifact_run_id: ${{ needs.resolve.outputs.run_id }}
       runner: ${{ vars.RUNNER_DEPLOY_STAGING || '["self-hosted","linux","env-staging"]' }}
       run_dast: false
     secrets: inherit
 
-  # -------------------------------------------------------------------------------- PRODUCTION (Alibaba Cloud)
+  # -------------------------------------------------------------------------------- PRODUCTION (later)
   production:
     name: Production
-    needs: [plan, test, staging]
+    needs: [resolve, test, staging]
     if: |
-      always() && needs.test.result == 'success' &&
-      (needs.staging.result == 'success' || (needs.staging.result == 'skipped' && inputs.skip_staging && vars.ALLOW_SKIP_STAGING == 'true'))
+      always() && vars.PRODUCTION_ENABLED == 'true' && needs.resolve.result == 'success' &&
+      (needs.staging.result == 'success' ||
+       (needs.staging.result == 'skipped' && needs.test.result == 'success' && inputs.skip_staging && vars.ALLOW_SKIP_STAGING == 'true'))
     uses: mmamdouhDevops/pipeline-templates/.github/workflows/deploy-stage.yml@v1
     with:
       environment: production
-      version: ${{ needs.plan.outputs.version }}
-      channel: ${{ needs.plan.outputs.channel }}
-      matrix: ${{ needs.plan.outputs.matrix }}
+      version: ${{ needs.resolve.outputs.version }}
+      channel: ${{ needs.resolve.outputs.channel }}
+      matrix: ${{ needs.resolve.outputs.matrix }}
+      artifact_run_id: ${{ needs.resolve.outputs.run_id }}
       runner: ${{ vars.RUNNER_DEPLOY_PRODUCTION || '["self-hosted","linux","env-production"]' }}
       run_dast: false
     secrets: inherit
 
+  # -------------------------------------------------------------------------------- staging hand-off
+  staging-handoff:
+    name: Hand-off (staging approved)
+    needs: [resolve, staging]
+    if: always() && needs.staging.result == 'success' && vars.PRODUCTION_ENABLED != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: pkg-*
+          path: dist
+          merge-multiple: true
+          run-id: ${{ needs.resolve.outputs.run_id }}
+          github-token: ${{ github.token }}
+      - name: Pre-release with the staged packages
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: v${{ needs.resolve.outputs.semver }}-rc.${{ needs.resolve.outputs.run_id }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+        run: |
+          gh release view "$TAG" >/dev/null 2>&1 && { echo "$TAG exists"; exit 0; }
+          gh release create "$TAG" dist/* --prerelease --target "$SHA" --title "$TAG (staging approved)" \
+            --notes "Build \`$VERSION\` passed test and staging. Production is not enabled yet (vars.PRODUCTION_ENABLED)."
+          {
+            echo "### ✅ $VERSION approved on staging"
+            echo "Pre-release **$TAG** holds the packages, SBOMs and checksums for the production hand-off."
+          } >> "$GITHUB_STEP_SUMMARY"
+
   # -------------------------------------------------------------------------------- release bookkeeping
   release:
     name: Tag, GitHub Release, merge-back PRs
-    needs: [plan, production]
+    needs: [resolve, production]
     if: always() && needs.production.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: write
       pull-requests: write
+      actions: read
     steps:
       - uses: actions/checkout@v4
         with:
@@ -179,20 +257,23 @@ jobs:
           pattern: pkg-*
           path: dist
           merge-multiple: true
+          run-id: ${{ needs.resolve.outputs.run_id }}
+          github-token: ${{ github.token }}
       - name: Tag + GitHub Release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: v${{ needs.plan.outputs.semver }}
-          VERSION: ${{ needs.plan.outputs.version }}
-          CHANNEL: ${{ needs.plan.outputs.channel }}
+          TAG: v${{ needs.resolve.outputs.semver }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          CHANNEL: ${{ needs.resolve.outputs.channel }}
+          SHA: ${{ needs.resolve.outputs.sha }}
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           if git rev-parse "$TAG" >/dev/null 2>&1; then
             echo "::warning::Tag $TAG already exists – keeping it"
           else
-            git tag -a "$TAG" -m "$CHANNEL $VERSION deployed to production"
+            git tag -a "$TAG" "$SHA" -m "$CHANNEL $VERSION deployed to production"
             git push origin "$TAG"
           fi
           gh release view "$TAG" >/dev/null 2>&1 || \
@@ -202,8 +283,8 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          BRANCH: ${{ github.ref_name }}
-          TAG: v${{ needs.plan.outputs.semver }}
+          BRANCH: ${{ inputs.release_branch }}
+          TAG: v${{ needs.resolve.outputs.semver }}
         run: |
           for target in main develop; do
             if gh pr list --head "$BRANCH" --base "$target" --state open --json number -q '.[0].number' | grep -q .; then

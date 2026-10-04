@@ -155,6 +155,7 @@ step "Repository variables"
 setvar() { run gh variable set "$1" -R "$REPO" --body "$2" >/dev/null && ok "$1=$2"; }
 setenvvar() { run gh variable set "$2" -R "$REPO" --env "$1" --body "$3" >/dev/null && ok "[$1] $2=$3"; }
 setvar APPROVAL_MODE "$APPROVAL_MODE"
+setvar PRODUCTION_ENABLED "${PRODUCTION_ENABLED:-false}"   # CD stops after staging until production is decided
 setvar RUNNER_CI "$RUNNER_CI"
 setvar RUNNER_DEPLOY_TEST '["self-hosted","linux","env-test"]'
 setvar RUNNER_DEPLOY_STAGING '["self-hosted","linux","env-staging"]'

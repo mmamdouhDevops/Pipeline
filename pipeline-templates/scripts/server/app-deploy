@@ -9,6 +9,7 @@
 #    app-deploy rollback <name>             switch back to the previous release
 #    app-deploy status [<name>]             current/previous release per component
 #    app-deploy prune-backups <dir> <db> <keep>   keep newest <keep> <db>_*.bak files
+#    app-deploy check [roles]              readiness of this server (web,api,integration,db,ai,ci)
 #    app-deploy version
 #
 #  Layout per component:  <deploy_path>/releases/<version>/   <deploy_path>/current -> releases/<version>
@@ -16,7 +17,7 @@
 #                         /etc/app-deploy/<name>.env (secrets)   /var/lib/app-deploy/<name>/ (state)
 # =============================================================================================
 set -euo pipefail
-VERSION_HELPER="1.0.0"
+VERSION_HELPER="1.1.0"
 STATE_ROOT=/var/lib/app-deploy
 CONF_ROOT=/etc/app-deploy
 log()  { echo "[app-deploy] $*"; }
@@ -301,11 +302,84 @@ cmd_prune_backups() {
   log "kept newest $keep backups of $db in $dir"
 }
 
+# ------------------------------------------------------------------ readiness check of this server
+#  app-deploy check [roles]   roles = comma list of web,api,integration,db,ai,ci (default: all detected)
+#  Prints one line per check:  OK|WARN|FAIL <check> <detail>   – exit 1 when any FAIL
+cmd_check() {
+  local roles="${1:-}" fails=0 warns=0
+  r()    { [[ -z "$roles" || ",$roles," == *",$1,"* ]]; }
+  ok()   { printf 'OK   %-28s %s\n' "$1" "$2"; }
+  warn() { printf 'WARN %-28s %s\n' "$1" "$2"; warns=$((warns+1)); }
+  bad()  { printf 'FAIL %-28s %s\n' "$1" "$2"; fails=$((fails+1)); }
+  . /etc/os-release
+  echo "== $(hostname) · $PRETTY_NAME · env: $(cat /etc/app-environment 2>/dev/null || echo '?') · roles: ${roles:-all}"
+  [[ "$VERSION_ID" == "24.04" ]] && ok os "$PRETTY_NAME" || warn os "$PRETTY_NAME (expected Ubuntu 24.04)"
+  ok app-deploy "$VERSION_HELPER"
+  ls /etc/sudoers.d/90-app-deploy /etc/sudoers.d/90-gh-runner >/dev/null 2>&1 && ok sudoers "app-deploy allow-list present" || warn sudoers "no allow-list in /etc/sudoers.d"
+  grep -q yes <<<"$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" && ok time-sync "NTP synchronized" || warn time-sync "clock not NTP-synchronized"
+  grep -q "Status: active" <<<"$(ufw status 2>/dev/null)" && ok firewall "ufw active" || warn firewall "ufw inactive"
+  local free; free=$(df -Pm /var | awk 'NR==2{print $4}')
+  (( free > 2048 )) && ok disk "/var ${free} MB free" || bad disk "/var only ${free} MB free"
+  local mem; mem=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)
+  (( mem > 512 )) && ok memory "${mem} MB available" || warn memory "only ${mem} MB available"
+
+  if r web || r api || r integration || r ai; then
+    if command -v nginx >/dev/null; then
+      systemctl is-active --quiet nginx && ok nginx "active $(nginx -v 2>&1 | cut -d/ -f2)" || bad nginx "installed but not running"
+      nginx -t >/dev/null 2>&1 && ok nginx-config "nginx -t passed" || bad nginx-config "nginx -t failed"
+    else bad nginx "not installed"; fi
+    local crt=/etc/ssl/app/server.crt
+    if [[ -f $crt && -f /etc/ssl/app/server.key ]]; then
+      local end days; end=$(openssl x509 -enddate -noout -in $crt | cut -d= -f2)
+      days=$(( ( $(date -d "$end" +%s) - $(date +%s) ) / 86400 ))
+      if (( days > 21 )); then ok tls-cert "$days days left ($(openssl x509 -subject -noout -in $crt | sed 's/.*CN *= *//'))"
+      elif (( days > 0 )); then warn tls-cert "expires in $days days"; else bad tls-cert "expired"; fi
+    else bad tls-cert "missing /etc/ssl/app/server.{crt,key}"; fi
+  fi
+  if r api || r integration; then
+    if command -v dotnet >/dev/null && grep -q '^Microsoft.AspNetCore.App 10\.' <<<"$(dotnet --list-runtimes 2>/dev/null)"; then
+      ok aspnetcore-10 "$(dotnet --list-runtimes | grep '^Microsoft.AspNetCore.App 10\.' | tail -1 | cut -d' ' -f2)"
+    else bad aspnetcore-10 "ASP.NET Core 10 runtime not installed"; fi
+  fi
+  if r ai; then
+    python3 -c 'import venv' 2>/dev/null && ok python-venv "$(python3 --version)" || bad python-venv "python3-venv missing"
+    command -v nvidia-smi >/dev/null && ok gpu "$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)" || warn gpu "no NVIDIA driver (CPU only)"
+  fi
+  if r db; then
+    if systemctl list-unit-files mssql-server.service >/dev/null 2>&1 && systemctl is-active --quiet mssql-server; then
+      ok sqlserver "mssql-server active"
+    elif command -v docker >/dev/null && grep -q mssql <<<"$(docker ps --format '{{.Image}}' 2>/dev/null)"; then
+      ok sqlserver "running in Docker"
+    else bad sqlserver "SQL Server not running"; fi
+    [[ -d /var/opt/mssql/backup ]] && ok backup-dir "/var/opt/mssql/backup ($(df -Pm /var/opt/mssql/backup | awk 'NR==2{print $4}') MB free)" || bad backup-dir "/var/opt/mssql/backup missing"
+  fi
+  if r ci; then
+    command -v dotnet >/dev/null && grep -q '^10\.' <<<"$(dotnet --list-sdks 2>/dev/null)" && ok dotnet-sdk-10 "$(dotnet --list-sdks | grep '^10\.' | tail -1 | cut -d' ' -f1)" || bad dotnet-sdk-10 "not installed"
+    command -v node >/dev/null && [[ "$(node -v)" == v24* ]] && ok node-24 "$(node -v)" || bad node-24 "Node 24 not installed"
+    command -v docker >/dev/null && systemctl is-active --quiet docker 2>/dev/null && ok docker "$(docker --version | cut -d, -f1)" || warn docker "not running (needed for DAST)"
+    { command -v sqlcmd >/dev/null || [[ -x /opt/mssql-tools18/bin/sqlcmd ]]; } && ok sqlcmd "mssql-tools18" || bad sqlcmd "not installed"
+    python3 -c 'import yaml' 2>/dev/null && ok python3-yaml "ok" || bad python3-yaml "missing"
+    local svc; svc=$( (systemctl list-units --type=service --state=running --no-legend 'actions.runner.*' 2>/dev/null || true) | awk '{print $1}' | paste -sd' ' -)
+    [[ -n "$svc" ]] && ok runner-service "$svc" || warn runner-service "no runner service running"
+  fi
+  # deployed components on this server
+  for m in "$STATE_ROOT"/*/manifest.json; do
+    [[ -f "$m" ]] || continue
+    local n v pth svcn; n=$(jq -r .name "$m"); v=$(jq -r .version "$m"); svcn=$(jq -r '.service_name // empty' "$m")
+    if [[ -n "$svcn" && "$(jq -r .package "$m")" != "static" ]]; then
+      systemctl is-active --quiet "$svcn" && ok "app:$n" "$v running" || bad "app:$n" "$v – service $svcn not running"
+    else ok "app:$n" "$v (static)"; fi
+  done
+  echo "== result: $fails failed, $warns warnings"
+  (( fails == 0 ))
+}
+
 case "${1:-}" in
   install)        cmd_install "${2:?bundle dir}" ;;
   rollback)       cmd_rollback "${2:?component name}" ;;
   status)         cmd_status "${2:-}" ;;
   prune-backups)  cmd_prune_backups "${2:?}" "${3:?}" "${4:?}" ;;
+  check)          cmd_check "${2:-}" ;;
   version)        echo "$VERSION_HELPER" ;;
   *) sed -n '2,20p' "$0"; exit 2 ;;
 esac

@@ -6,8 +6,13 @@
 #    issue                 – an approval issue; works on every plan (approvers: vars.APPROVERS_<ENV>)
 #    none                  – no gate (only for sandboxes)
 #
-#  Per component (matrix): runner tasks (DB backup / migrations / scripts) → host tasks on every server
-#  of the component's role (install, health, automatic rollback) → post tasks (smoke, contract) → DAST.
+#  Per component (matrix):
+#    preflight  – environment ready? (runner tools, every server of every role via `app-deploy check`,
+#                 SQL login). Not ready → the job stops BEFORE anything is changed.
+#    download   – pkg-<component> from the CI release build (artifact_run_id), sha256 verified
+#    runner tasks (DB backup / migrations / scripts) → host tasks on every server of the component's role
+#    (install, health, automatic rollback) → post tasks (smoke, contract) → DAST (test only).
+#  Every step is safe to repeat: use "Re-run failed jobs" after fixing the cause.
 # =============================================================================================
 name: deploy-stage
 
@@ -24,6 +29,10 @@ on:
         type: string
         required: true
       matrix:
+        type: string
+        required: true
+      artifact_run_id:
+        description: CI run that holds pkg-<component>
         type: string
         required: true
       runner:
@@ -85,11 +94,33 @@ jobs:
       fail-fast: true
       max-parallel: 1               # components deploy one after another (database before APIs if listed first)
       matrix: ${{ fromJSON(inputs.matrix) }}
+    env:
+      # ---- topology (environment variables) – shared by preflight and deploy ----
+      DEPLOY_MODE: ${{ vars.DEPLOY_MODE }}
+      WEB_HOSTS: ${{ vars.WEB_HOSTS }}
+      API_HOSTS: ${{ vars.API_HOSTS }}
+      INTEGRATION_HOSTS: ${{ vars.INTEGRATION_HOSTS }}
+      DB_HOSTS: ${{ vars.DB_HOSTS }}
+      AI_HOSTS: ${{ vars.AI_HOSTS }}
+      DEPLOY_SSH_USER: ${{ vars.DEPLOY_SSH_USER }}
+      DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+      DEPLOY_SSH_KNOWN_HOSTS: ${{ vars.DEPLOY_SSH_KNOWN_HOSTS }}
+      DB_SERVER: ${{ vars.DB_SERVER }}
+      DB_ADMIN_USER: ${{ secrets.DB_ADMIN_USER }}
+      DB_ADMIN_PASSWORD: ${{ secrets.DB_ADMIN_PASSWORD }}
     steps:
-      - uses: actions/download-artifact@v4
+      - name: Preflight · is ${{ inputs.environment }} ready?
+        uses: mmamdouhDevops/pipeline-templates/actions/env-check@v1
+        with:
+          environment: ${{ inputs.environment }}
+
+      - name: Download pkg-${{ matrix.name }} (CI run ${{ inputs.artifact_run_id }})
+        uses: actions/download-artifact@v4
         with:
           name: pkg-${{ matrix.name }}
           path: ${{ runner.temp }}/pkg
+          run-id: ${{ inputs.artifact_run_id }}
+          github-token: ${{ github.token }}
 
       - name: Deploy
         id: deploy
@@ -100,22 +131,9 @@ jobs:
           environment: ${{ inputs.environment }}
           package-dir: ${{ runner.temp }}/pkg
         env:
-          # ---- topology (environment variables) ----
-          DEPLOY_MODE: ${{ vars.DEPLOY_MODE }}
-          WEB_HOSTS: ${{ vars.WEB_HOSTS }}
-          API_HOSTS: ${{ vars.API_HOSTS }}
-          INTEGRATION_HOSTS: ${{ vars.INTEGRATION_HOSTS }}
-          DB_HOSTS: ${{ vars.DB_HOSTS }}
-          AI_HOSTS: ${{ vars.AI_HOSTS }}
-          DEPLOY_SSH_USER: ${{ vars.DEPLOY_SSH_USER }}
-          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
-          DEPLOY_SSH_KNOWN_HOSTS: ${{ vars.DEPLOY_SSH_KNOWN_HOSTS }}
           TLS_CERT: ${{ vars.TLS_CERT }}
           TLS_KEY: ${{ vars.TLS_KEY }}
           # ---- database (runner tasks) ----
-          DB_SERVER: ${{ vars.DB_SERVER }}
-          DB_ADMIN_USER: ${{ secrets.DB_ADMIN_USER }}
-          DB_ADMIN_PASSWORD: ${{ secrets.DB_ADMIN_PASSWORD }}
           DB_BACKUP_DIR: ${{ vars.DB_BACKUP_DIR }}
           DB_BACKUP_KEEP: ${{ vars.DB_BACKUP_KEEP }}
           DB_NAME: ${{ vars[matrix.db_name_var] }}
